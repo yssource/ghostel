@@ -56,16 +56,23 @@ Populated by `ghostel-debug-ghostel'.  A plist with:
   :command          — the ((\"/bin/sh\" \"-c\" \"<wrapper>\")) list
                       that was passed to `make-process'
   :process-environment — copy taken just before `make-process'
-  :filter-bytes     — first `:filter-cap' bytes of PTY output
-  :filter-cap       — soft cap (bytes) for :filter-bytes
-  :filter-truncated — non-nil if more PTY output arrived after the cap
-  :send-keys        — first `:send-cap' (TIMESTAMP . STRING) sends
+  :filter-events    — list of (TIMESTAMP . CHUNK) PTY-output events,
+                      chronological, capped at `:filter-cap' total bytes
+  :filter-cap       — soft cap (total bytes) for :filter-events
+  :filter-bytes     — running total of bytes appended to :filter-events
+  :filter-truncated — non-nil once cap reached and chunks dropped
+  :send-keys        — list of (TIMESTAMP . STRING) sends, capped at `:send-cap'
   :send-cap         — soft cap (count) for :send-keys
   :send-truncated   — non-nil if more sends arrived after the cap
-Read by `ghostel-debug-info'.")
+Read by `ghostel-debug-info'.  Filter events and sends share a
+single chronological timeline in the report so `sent X, received
+no echo for Ns' is visible at a glance.")
 
-(defconst ghostel-debug--filter-cap 4096
-  "Soft cap (bytes) on `ghostel-debug--spawn-capture' :filter-bytes.")
+(defconst ghostel-debug--filter-cap (* 16 1024)
+  "Soft cap (total bytes) on `ghostel-debug--spawn-capture' :filter-events.
+Sized to comfortably cover an initial prompt plus a handful of
+input/echo round-trips so post-spawn behavior (not just the prompt)
+is visible in the timeline.")
 
 (defconst ghostel-debug--send-cap 64
   "Soft cap (entries) on `ghostel-debug--spawn-capture' :send-keys.")
@@ -850,31 +857,16 @@ and the report should still render usefully on those Emacsen."
                          (length (tramp-compute-multi-hops vec)))
                      (error nil)))))
     (insert (format "Multi-hop length:    %s\n" (or hops "(unknown)"))))
-  ;; The TERM-stripping diagnostic that drove the second #224 fix.
-  ;; If `(getenv "TERM")' equals an entry in the default-toplevel
-  ;; `process-environment', `tramp-local-environment-variable-p'
-  ;; treats it as ambient and strips ghostel's push, leaving the
-  ;; remote shell with `tramp-terminal-type' (= "dumb" by default).
-  (let* ((cur-term (getenv "TERM"))
-         (top-env (default-toplevel-value 'process-environment))
-         (top-term-entry (cl-find-if
-                          (lambda (e)
-                            (and (stringp e)
-                                 (string-prefix-p "TERM=" e)))
-                          top-env))
-         (top-term (and top-term-entry
-                        (substring top-term-entry 5)))
-         (would-strip (and cur-term top-term
-                           (string= cur-term top-term))))
-    (insert (format "TERM (current):      %s\n"
-                    (or cur-term "(unset)")))
-    (insert (format "TERM (toplevel):     %s\n"
-                    (or top-term "(unset)")))
-    (insert (format "TRAMP would strip pushed TERM: %s\n"
-                    (cond (would-strip
-                           "YES — current matches toplevel; ghostel's push\n                                would be filtered as ambient")
-                          ((null cur-term) "n/a (TERM unset)")
-                          (t "no"))))))
+  ;; TERM in the *connection shell* — what TRAMP exports for
+  ;; `process-file' calls and (without our preamble) what the
+  ;; spawned shell would inherit.  Ghostel's spawned shell does
+  ;; NOT see this directly: the on-remote `/bin/sh -c' preamble
+  ;; in `ghostel--remote-term-preamble' overrides TERM via
+  ;; `infocmp xterm-ghostty' before exec'ing the shell.  See the
+  ;; Spawn capture's wrapper command for the actual TERM the
+  ;; spawned shell ends up with.
+  (insert (format "TERM (connection shell): %s\n"
+                  (or (getenv "TERM") "(unset)"))))
 
 (defun ghostel-debug--insert-spawn-capture (cap)
   "Render the spawn capture plist CAP into the current buffer.
@@ -943,43 +935,64 @@ delta is what ghostel + TRAMP actually contributed."
         (insert "  Missing vs current (current has these, spawn didn't):\n")
         (dolist (e (sort (copy-sequence removed) #'string<))
           (insert (format "    - %s\n" e)))))))
-  ;; First N bytes of PTY output.  Did bash even start?  Send a
-  ;; prompt?  Echo back garbage?  This is the second-most useful
-  ;; signal after the wrapper script.
-  (let ((bytes (plist-get cap :filter-bytes))
-        (cap-size (plist-get cap :filter-cap))
-        (truncated (plist-get cap :filter-truncated)))
-    (insert (format "\nFirst PTY output (cap=%d bytes, %d captured%s):\n"
-                    cap-size (length bytes)
-                    (if truncated ", more arrived (truncated)" "")))
+  ;; Unified RECV/SEND timeline.  Interleaving PTY output and
+  ;; keystrokes by timestamp makes echo gaps obvious — a SEND "l"
+  ;; followed only by another SEND (no RECV "l" between) is the
+  ;; #224 signature.  Keeping them as separate sections (the previous
+  ;; layout) hid that pattern.
+  (ghostel-debug--insert-spawn-timeline cap))
+
+(defun ghostel-debug--insert-spawn-timeline (cap)
+  "Render CAP's interleaved RECV/SEND timeline into the current buffer.
+CAP is the spawn-capture plist (see `ghostel-debug--spawn-capture').
+Long chunks are truncated for display; the full bytes remain in
+the plist."
+  (let* ((t0 (plist-get cap :time))
+         (recv-cap (plist-get cap :filter-cap))
+         (recv-bytes (plist-get cap :filter-bytes))
+         (recv-events (plist-get cap :filter-events))
+         (recv-truncated (plist-get cap :filter-truncated))
+         (send-cap (plist-get cap :send-cap))
+         (sends (plist-get cap :send-keys))
+         (send-truncated (plist-get cap :send-truncated))
+         (events
+          (sort (append
+                 (mapcar (lambda (e)
+                           (list (car e) :recv (cdr e)))
+                         recv-events)
+                 (mapcar (lambda (s)
+                           (list (car s) :send (cdr s))) sends))
+                (lambda (a b) (time-less-p (car a) (car b))))))
+    (insert (format
+             "\nTimeline (RECV cap=%d bytes/%d captured%s; SEND cap=%d/%d captured%s):\n"
+             recv-cap (or recv-bytes 0)
+             (if recv-truncated ", more dropped" "")
+             send-cap (length sends)
+             (if send-truncated ", more dropped" "")))
     (cond
-     ((zerop (length bytes))
-      (insert "  (nothing — shell never wrote to its PTY)\n"))
+     ((null events)
+      (insert "  (no PTY output, no sends — shell never wrote and Emacs never typed)\n"))
      (t
       (let ((print-escape-control-characters t)
-            (print-escape-newlines t))
-        (insert (format "  %s\n" (prin1-to-string bytes)))))))
-  ;; First N keystrokes.  Confirms whether anything left Emacs at all.
-  (let ((keys (plist-get cap :send-keys))
-        (cap-size (plist-get cap :send-cap))
-        (truncated (plist-get cap :send-truncated))
-        (t0 (plist-get cap :time)))
-    (insert (format "\nFirst sends (cap=%d, %d captured%s):\n"
-                    cap-size (length keys)
-                    (if truncated ", more sent (truncated)" "")))
-    (cond
-     ((null keys)
-      (insert "  (no `ghostel--send-string' calls during capture)\n"))
-     (t
-      (let ((print-escape-control-characters t)
-            (print-escape-newlines t))
-        (cl-loop for (ts . s) in keys
-                 for i from 1
-                 do (insert
-                     (format "  %2d. +%6.3fs  %s\n"
-                             i
-                             (float-time (time-subtract ts t0))
-                             (prin1-to-string s)))))))))
+            (print-escape-newlines t)
+            (display-cap 240))
+        (dolist (ev events)
+          (let* ((ts (nth 0 ev))
+                 (kind (nth 1 ev))
+                 (data (nth 2 ev))
+                 (label (if (eq kind :send) "SEND" "RECV"))
+                 (truncated (> (length data) display-cap))
+                 (shown (if truncated
+                            (substring data 0 display-cap)
+                          data)))
+            (insert (format "  +%7.3fs  %s  %s%s\n"
+                            (float-time (time-subtract ts t0))
+                            label
+                            (prin1-to-string shown)
+                            (if truncated
+                                (format " (… +%d bytes)"
+                                        (- (length data) display-cap))
+                              ""))))))))))
 
 (defun ghostel-debug--insert-remote-probes (ghostel-buf)
   "Run live probes against the remote of GHOSTEL-BUF and insert results.
@@ -1124,8 +1137,9 @@ into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once."
                   :process-environment spawn-env
                   :command (and (processp proc)
                                 (process-command proc))
-                  :filter-bytes ""
+                  :filter-events nil
                   :filter-cap ghostel-debug--filter-cap
+                  :filter-bytes 0
                   :filter-truncated nil
                   :send-keys nil
                   :send-cap ghostel-debug--send-cap
@@ -1140,15 +1154,18 @@ into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once."
       proc)))
 
 (defun ghostel-debug--capture-filter (proc output)
-  "Append OUTPUT to the capture's :filter-bytes for PROC's buffer.
-Bounded by `:filter-cap'; sets `:filter-truncated' once exceeded."
+  "Append OUTPUT to the capture's :filter-events for PROC's buffer.
+Each call appends a (TIMESTAMP . CHUNK) event so the post-mortem
+report can interleave PTY output with sends on a single timeline.
+Bounded by `:filter-cap' total bytes; sets `:filter-truncated' once
+the cap is hit and further chunks are dropped."
   (when (and (stringp output)
              (buffer-live-p (process-buffer proc)))
     (with-current-buffer (process-buffer proc)
       (when ghostel-debug--spawn-capture
         (let* ((cap (plist-get ghostel-debug--spawn-capture :filter-cap))
-               (cur (plist-get ghostel-debug--spawn-capture :filter-bytes))
-               (room (- cap (length cur))))
+               (total (plist-get ghostel-debug--spawn-capture :filter-bytes))
+               (room (- cap total)))
           (cond
            ((<= room 0)
             (unless (plist-get ghostel-debug--spawn-capture
@@ -1158,10 +1175,16 @@ Bounded by `:filter-cap'; sets `:filter-truncated' once exceeded."
                                :filter-truncated t))))
            (t
             (let* ((take (min room (length output)))
-                   (fits (substring output 0 take)))
+                   (fits (substring output 0 take))
+                   (events (plist-get ghostel-debug--spawn-capture
+                                      :filter-events)))
+              (setq ghostel-debug--spawn-capture
+                    (plist-put ghostel-debug--spawn-capture :filter-events
+                               (append events
+                                       (list (cons (current-time) fits)))))
               (setq ghostel-debug--spawn-capture
                     (plist-put ghostel-debug--spawn-capture :filter-bytes
-                               (concat cur fits)))
+                               (+ total take)))
               (when (> (length output) take)
                 (setq ghostel-debug--spawn-capture
                       (plist-put ghostel-debug--spawn-capture

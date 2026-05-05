@@ -8282,7 +8282,8 @@ nil so the fallback warning fires."
 (ert-deftest ghostel-test-start-process-local-bash-integration-keeps-early-echo ()
   "Local bash integration must keep `stty echo' in the wrapper.
 Old bash versions can initialize readline before the ENV-injected
-integration script runs, so input echo must be enabled before exec."
+integration script runs, so input echo must be enabled before exec.
+`sane' in `ghostel--default-stty' is what guarantees echo here."
   (let ((captured-env nil)
         (orig-make-process (symbol-function #'make-process)))
     (cl-letf (((symbol-function #'make-process)
@@ -8300,7 +8301,10 @@ integration script runs, so input echo must be enabled before exec."
           (unwind-protect
               (let ((cmd (process-command proc)))
                 (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
-                (should (string-match-p "stty .* -ixon echo\\b" (nth 2 cmd)))
+                (should (string-match-p
+                         (concat "stty " (regexp-quote ghostel--default-stty))
+                         (nth 2 cmd)))
+                (should (string-match-p "\\bsane\\b" (nth 2 cmd)))
                 (should (string-match-p "exec /bin/bash --posix" (nth 2 cmd)))
                 (should (member "GHOSTEL_BASH_INJECT=1" captured-env))
                 (should (seq-some (lambda (s) (string-prefix-p "ENV=" s))
@@ -8639,7 +8643,7 @@ while :; do sleep 0.1; done'\n")
           (should (equal (nth 1 captured) '("/etc/hosts")))
           (should (numberp (nth 2 captured)))
           (should (numberp (nth 3 captured)))
-          (should (equal (nth 4 captured) "erase '^?' iutf8 -ixon echo"))
+          (should (equal (nth 4 captured) ghostel--default-stty))
           (should (null (nth 5 captured)))
           ;; Local default-directory — no TRAMP — so remote-p must be nil.
           (should (null (nth 6 captured))))
@@ -8870,10 +8874,8 @@ silently misbehave for #224-class bugs) belong in the standard report."
                 (should (string-match-p "direct-async (effective):" content))
                 (should (string-match-p "Would dispatch direct-async:" content))
                 (should (string-match-p "Multi-hop length:" content))
-                (should (string-match-p "TERM (current):" content))
-                (should (string-match-p "TERM (toplevel):" content))
                 (should (string-match-p
-                         "TRAMP would strip pushed TERM:" content))))))
+                         "TERM (connection shell):" content))))))
       (when (get-buffer "*ghostel-debug*")
         (kill-buffer "*ghostel-debug*")))))
 
@@ -8922,30 +8924,36 @@ sections all materialize."
     (unwind-protect
         (save-window-excursion
           (ghostel-test--with-compile-buffer buf
-            (setq-local ghostel-debug--spawn-capture
-                        (list :time (current-time)
-                              :default-directory "/ssh:host.example.com:/tmp/"
-                              :remote-p t
-                              :program "/bin/bash"
-                              :program-args nil
-                              :height 24 :width 80
-                              :stty-flags "erase '^?' iutf8 -ixon"
-                              :extra-env nil
-                              :process-environment
-                              '("INSIDE_EMACS=ghostel"
-                                "TERM=xterm-ghostty"
-                                "PATH=/usr/bin")
-                              :command
-                              '("/bin/sh" "-c"
-                                "TERM=xterm-256color; if infocmp xterm-ghostty >/dev/null 2>&1; then TERM=xterm-ghostty; fi; export TERM; exec /bin/bash")
-                              :filter-bytes "\e]0;hostname\007$ "
-                              :filter-cap 4096
-                              :filter-truncated nil
-                              :send-keys
-                              (list (cons (current-time) "l")
-                                    (cons (current-time) "s"))
-                              :send-cap 64
-                              :send-truncated nil))
+            (let* ((t0 (current-time))
+                   (t1 (time-add t0 0.010))
+                   (t2 (time-add t0 0.500))
+                   (t3 (time-add t0 0.700)))
+              (setq-local ghostel-debug--spawn-capture
+                          (list :time t0
+                                :default-directory "/ssh:host.example.com:/tmp/"
+                                :remote-p t
+                                :program "/bin/bash"
+                                :program-args nil
+                                :height 24 :width 80
+                                :stty-flags ghostel--default-stty
+                                :extra-env nil
+                                :process-environment
+                                '("INSIDE_EMACS=ghostel"
+                                  "TERM=xterm-ghostty"
+                                  "PATH=/usr/bin")
+                                :command
+                                '("/bin/sh" "-c"
+                                  "TERM=xterm-256color; if infocmp xterm-ghostty >/dev/null 2>&1; then TERM=xterm-ghostty; fi; export TERM; exec /bin/bash")
+                                :filter-events
+                                (list (cons t1 "\e]0;hostname\007$ "))
+                                :filter-cap 16384
+                                :filter-bytes (length "\e]0;hostname\007$ ")
+                                :filter-truncated nil
+                                :send-keys
+                                (list (cons t2 "l")
+                                      (cons t3 "s"))
+                                :send-cap 64
+                                :send-truncated nil)))
             (ghostel-debug-info)
             (with-current-buffer "*ghostel-debug*"
               (let ((content (buffer-string)))
@@ -8961,46 +8969,59 @@ sections all materialize."
                 ;; Env delta header.
                 (should (string-match-p "process-environment at spawn"
                                         content))
-                ;; First PTY output preview.
-                (should (string-match-p "First PTY output" content))
-                ;; First sends preview.
-                (should (string-match-p "First sends" content))
-                (should (string-match-p "\"l\"" content))))))
+                ;; Unified RECV/SEND timeline.
+                (should (string-match-p "^Timeline (RECV cap=" content))
+                (should (string-match-p "RECV  \"" content))
+                (should (string-match-p "SEND  \"l\"" content))
+                (should (string-match-p "SEND  \"s\"" content))))))
       (when (get-buffer "*ghostel-debug*")
         (kill-buffer "*ghostel-debug*")))))
 
 (ert-deftest ghostel-test-debug-capture-filter-bounded ()
-  "`ghostel-debug--capture-filter' caps :filter-bytes and flags truncation.
-Keeps the first :filter-cap bytes verbatim, sets :filter-truncated once
-overflow occurs, and stops growing afterwards (so steady-state shell
-output doesn't accumulate unboundedly)."
+  "`ghostel-debug--capture-filter' records timestamped events and caps total bytes.
+Each call appends a (TS . CHUNK) event up to :filter-cap total bytes.
+Once the cap is hit, :filter-truncated is set and further chunks are
+dropped (so steady-state shell output doesn't accumulate unboundedly)."
   (ghostel-test--with-compile-buffer buf
     (setq-local ghostel-debug--spawn-capture
-                (list :filter-bytes ""
+                (list :filter-events nil
                       :filter-cap 16
+                      :filter-bytes 0
                       :filter-truncated nil))
     (let ((proc (make-pipe-process :name "ghostel-test-capture"
                                    :buffer buf :noquery t)))
       (unwind-protect
-          (progn
+          (cl-flet ((events-bytes ()
+                      (mapconcat #'cdr
+                                 (plist-get ghostel-debug--spawn-capture
+                                            :filter-events)
+                                 "")))
             (ghostel-debug--capture-filter proc "0123456789")
-            (should (equal (plist-get ghostel-debug--spawn-capture
-                                      :filter-bytes)
-                           "0123456789"))
+            (should (= 1 (length (plist-get ghostel-debug--spawn-capture
+                                            :filter-events))))
+            (should (equal (events-bytes) "0123456789"))
+            (should (= 10 (plist-get ghostel-debug--spawn-capture
+                                     :filter-bytes)))
             (should-not (plist-get ghostel-debug--spawn-capture
                                    :filter-truncated))
-            ;; This chunk overflows the 16-byte cap (10 + 10 = 20).
+            ;; This chunk overflows the 16-byte cap (10 + 10 = 20):
+            ;; the first 6 bytes fit, the rest is dropped and the
+            ;; truncated flag flips on.
             (ghostel-debug--capture-filter proc "ABCDEFGHIJ")
-            (should (equal (plist-get ghostel-debug--spawn-capture
-                                      :filter-bytes)
-                           "0123456789ABCDEF"))
+            (should (= 2 (length (plist-get ghostel-debug--spawn-capture
+                                            :filter-events))))
+            (should (equal (events-bytes) "0123456789ABCDEF"))
+            (should (= 16 (plist-get ghostel-debug--spawn-capture
+                                     :filter-bytes)))
             (should (plist-get ghostel-debug--spawn-capture
                                :filter-truncated))
-            ;; Further chunks no-op against the cap.
+            ;; Further chunks no-op against the cap — no new event,
+            ;; total bytes unchanged.
             (ghostel-debug--capture-filter proc "more")
-            (should (equal (plist-get ghostel-debug--spawn-capture
-                                      :filter-bytes)
-                           "0123456789ABCDEF")))
+            (should (= 2 (length (plist-get ghostel-debug--spawn-capture
+                                            :filter-events))))
+            (should (= 16 (plist-get ghostel-debug--spawn-capture
+                                     :filter-bytes))))
         (delete-process proc)))))
 
 (ert-deftest ghostel-test-debug-capture-send-bounded ()

@@ -3304,6 +3304,23 @@ caller sees one combined :env / :temp-dirs / :temp-files."
           (setq out (plist-put out key (append b e))))))
     out))
 
+(defconst ghostel--default-stty "-nl sane iutf8 -ixon erase '^?'"
+  "Baseline stty flags applied before exec'ing the spawned program.
+`sane' resets line discipline to known-good defaults — including
+echo, canonical mode, and signal handling - which defends against
+upstreams that leave the PTY in an unexpected state by the time the
+spawned shell starts (TRAMP env stripping, custom remote /etc/bashrc, old
+bash readline init order).  The explicit flags layer on top of `sane':
+- `iutf8': kernel UTF-8 awareness so backspace erases multi-byte
+  characters correctly.  `sane' may clear it on some implementations,
+  so set it explicitly afterwards.
+- `-ixon': disable XON/XOFF flow control so the XON/XOFF characters
+  pass through to the application instead of being swallowed by the
+  PTY line discipline.
+- `erase ^?': Emacs PTYs leave VERASE undefined, but shells like
+  fish check VERASE at startup to decide whether the DEL byte
+  means backspace.")
+
 (defun ghostel--setup-remote-integration (shell-type)
   "Set up shell integration on the remote host for SHELL-TYPE.
 Reads the local integration script, writes it (with any necessary
@@ -3345,7 +3362,7 @@ Returns nil on failure."
                                           "fi\n"
                                           integration))
              (list :env nil :args (list "--rcfile" path)
-                   :stty "erase '^?' iutf8 -ixon echo" :temp-files (list temp))))
+                   :stty ghostel--default-stty :temp-files (list temp))))
           ;; Zsh: ZDOTDIR replaces .zshenv search, so we restore it,
           ;; source the user's .zshenv, then load integration.
           ('zsh
@@ -3374,7 +3391,7 @@ Returns nil on failure."
                                           "    'builtin' 'unset' '_ghostel_file'\n"
                                           "}\n"))
              (list :env (list (format "ZDOTDIR=%s" remote-dir))
-                   :args nil :stty "erase '^?' iutf8 -ixon"
+                   :args nil :stty ghostel--default-stty
                    :temp-dirs (list temp-dir))))
           ;; Fish: -C runs after config, so just source the script.
           ('fish
@@ -3385,7 +3402,7 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
-                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp)))))))
+                   :stty ghostel--default-stty :temp-files (list temp)))))))
         (if tinfo
             (ghostel--merge-integration-plists base tinfo)
           base))
@@ -3539,21 +3556,12 @@ Installs `ghostel--filter' and `ghostel--sentinel', sets binary I/O,
 matches the PTY window size, and stores the process in
 `ghostel--process'.  Returns the process."
   ;; Wrap the program in /bin/sh -c so we can configure the PTY
-  ;; before the program reads its terminal attributes:
-  ;;  - erase '^?': Emacs PTYs leave VERASE undefined, but
-  ;;    shells like fish check VERASE at startup to decide
-  ;;    whether \x7f means backspace.
-  ;;  - iutf8: kernel-level UTF-8 awareness so backspace
-  ;;    correctly erases multi-byte characters.
-  ;;  - -ixon: disable XON/XOFF flow control so C-q and C-s
-  ;;    pass through to the application instead of being
-  ;;    swallowed by the PTY line discipline.
-  ;;  - echo (bash-only): readline buffers its own echo, so
-  ;;    we need PTY-level echo early in startup.  Old bash
-  ;;    versions (notably macOS /bin/bash 3.2) may initialize
-  ;;    readline before ENV-sourced integration runs.
-  ;; The clear-screen hides the stty output.  exec replaces
-  ;; the wrapper so only the target program remains.
+  ;; before the program reads its terminal attributes.  See
+  ;; `ghostel--default-stty' for the default flag set and rationale;
+  ;; STTY-FLAGS is whatever the caller picked (typically that default
+  ;; or a remote-integration variant).  The clear-screen hides the
+  ;; stty output.  exec replaces the wrapper so only the target
+  ;; program remains.
   (let* ((shell-command
           (list "/bin/sh" "-c"
                 (concat
@@ -3691,12 +3699,9 @@ on the remote host."
                       ((and (eq shell-type 'bash) integration-env)
                        (list "--posix"))
                       (t nil)))
-         (stty-flags (cond
-                      (remote-integration
-                       (plist-get remote-integration :stty))
-                      ((eq shell-type 'bash)
-                       "erase '^?' iutf8 -ixon echo")
-                      (t "erase '^?' iutf8 -ixon")))
+         (stty-flags (if remote-integration
+                         (plist-get remote-integration :stty)
+                       ghostel--default-stty))
          (extra-env (append
                      (unless remote-p
                        (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
@@ -4348,7 +4353,7 @@ Signals `user-error' if BUFFER already has a live ghostel process."
         (ghostel--set-size-with-cell-dims ghostel--term height width)
         (ghostel--apply-palette ghostel--term)
         (ghostel--spawn-pty program args height width
-                            "erase '^?' iutf8 -ixon echo" nil remote-p)))))
+                            ghostel--default-stty nil remote-p)))))
 
 ;;;###autoload
 (defun ghostel-project (&optional arg)

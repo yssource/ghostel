@@ -423,11 +423,13 @@ same as in any compilation buffer."
             (compilation--update-in-progress-mode-line))
           (ghostel-compile--finalize buffer exit (current-time)))))))
 
-(defconst ghostel-compile--stty-flags "erase '^?' iutf8 -ixon -echo"
+(defconst ghostel-compile--stty-flags
+  (concat ghostel--default-stty " -echo")
   "`stty' flags for the compile PTY.
-Matches `ghostel--spawn-pty's flags for non-shell programs, with
-`echo' off so we don't render an echoed copy of the command (which
-users already see in the header).")
+Layers `-echo' on top of `ghostel--default-stty' so we don't render
+an echoed copy of the command (which users already see in the
+header).  `sane' in the baseline turns echo on; the trailing
+`-echo' overrides it.")
 
 (defun ghostel-compile--spawn (command buffer height width)
   "Spawn COMMAND in BUFFER via a PTY sized HEIGHT rows by WIDTH columns.
