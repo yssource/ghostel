@@ -3919,21 +3919,13 @@ is non-nil so the debugger fires for hook authors who want it."
      nil)))
 
 (defun ghostel--prompt-input-start ()
-  "From the start of a prompt line, move past the prompt marker to user input.
-Skips to end of line, then backs up past trailing whitespace to find
-the last non-whitespace+whitespace boundary (e.g. after `$ ' or `# ')."
-  (let ((bol (point)))
-    (end-of-line)
-    (skip-chars-backward " \t" bol)       ; skip trailing padding
-    (skip-chars-backward "^ \t" bol)      ; skip last word (user input)
-    (when (> (point) bol)
-      (skip-chars-backward " \t" bol)     ; skip space before user input
-      (skip-chars-forward " \t"           ; move forward past that space
-                          (line-end-position)))
-    ;; If we landed on the last visible char (no command follows),
-    ;; step past it and the trailing space (e.g. "# " → past both).
-    (when (looking-at-p "\\S-\\s-*$")
-      (forward-char 2))))
+  "From the start of a `ghostel-prompt' region, move past the prefix.
+If `ghostel-input' begins on the same line, point lands at its
+start; otherwise point lands just past the prompt-prefix region —
+the natural position where the user would begin typing."
+  (goto-char (or (next-single-property-change
+                  (point) 'ghostel-prompt nil (line-end-position))
+                 (line-end-position))))
 
 (defun ghostel--navigate-next-prompt (&optional n)
   "Move point to the start of the Nth next prompt region."
@@ -3957,10 +3949,14 @@ the last non-whitespace+whitespace boundary (e.g. after `$ ' or `# ')."
   "Move point to the start of the Nth previous prompt region."
   (let ((pos (point)))
     (dotimes (_ (or n 1))
-      ;; If inside a prompt, first skip backward past it.
+      ;; If inside or on a prompt, first skip backward past it.
+      (when (or (get-text-property pos 'ghostel-input)
+                (and (> pos (point-min))
+                     (get-text-property (1- pos) 'ghostel-input)))
+        (setq pos (or (previous-single-property-change pos 'ghostel-input)
+                      (point-min))))
       (when (or (get-text-property pos 'ghostel-prompt)
-                (and (= pos (point-max))
-                     (> pos (point-min))
+                (and (> pos (point-min))
                      (get-text-property (1- pos) 'ghostel-prompt)))
         (setq pos (or (previous-single-property-change pos 'ghostel-prompt)
                       (point-min))))

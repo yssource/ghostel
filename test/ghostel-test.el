@@ -5318,46 +5318,70 @@ declare that variable buffer-locally so the live buffer qualifies."
 ;; Test: prompt navigation
 ;; -----------------------------------------------------------------------
 
+(defun ghostel-test--insert-prompt (prefix &optional input)
+  "Insert PREFIX + optional INPUT + newline with renderer properties.
+`ghostel-prompt' is set on PREFIX, `ghostel-input' on INPUT (or
+nothing if INPUT is nil — empty current prompt)."
+  (let ((p-start (point)))
+    (insert prefix)
+    (put-text-property p-start (point) 'ghostel-prompt t)
+    (when input
+      (let ((i-start (point)))
+        (insert input)
+        (put-text-property i-start (point) 'ghostel-input t))))
+  (insert "\n"))
+
 (ert-deftest ghostel-test-prompt-navigation ()
-  "Test next/previous prompt navigation."
+  "Test next/previous prompt navigation.
+Mirrors the renderer's two-property layout: `ghostel-prompt' on the
+prefix only, `ghostel-input' on the user-typed command."
   (with-temp-buffer
-    ;; Realistic layout: property covers WHOLE row (row-level fallback),
-    ;; prompt text is "my-prompt # " followed by user command.
-    (let ((p1 (point)))
-      (insert "my-prompt # cmd1\n")
-      (put-text-property p1 (1- (point)) 'ghostel-prompt t))
+    (ghostel-test--insert-prompt "$ " "cmd1")
     (insert "output1\n")
-    (let ((p2 (point)))
-      (insert "my-prompt # cmd2\n")
-      (put-text-property p2 (1- (point)) 'ghostel-prompt t))
-    (insert "output2\n")
-    (let ((p3 (point)))
-      (insert "my-prompt # cmd3\n")
-      (put-text-property p3 (1- (point)) 'ghostel-prompt t))
-    (insert "output3\n")
+    ;; Multi-word command: navigation must land on the first word,
+    ;; not the last (the old skip-chars logic skipped the last word
+    ;; backward and incorrectly treated it as the input start).
+    (ghostel-test--insert-prompt "$ " "echo bb cc")
+    (insert "bb cc\n")
+    ;; Single-char trailing arg: the old `(forward-char 2)` jumped
+    ;; past the input's last char AND the newline, landing on the
+    ;; OUTPUT line below.  Must land on `e' of `echo'.
+    (ghostel-test--insert-prompt "$ " "echo b")
+    (insert "b\n")
+    ;; Empty current prompt — no `ghostel-input' after the prefix.
+    (ghostel-test--insert-prompt "$ ")
 
+    ;; Forward navigation from beginning of buffer.
     (goto-char (point-min))
+    (ghostel--navigate-next-prompt 1)
+    (should (looking-at "echo bb cc"))         ; multi-word: lands on first word
 
     (ghostel--navigate-next-prompt 1)
-    (should (looking-at "cmd2"))                           ; next-prompt lands on cmd2
+    (should (looking-at "echo b$"))            ; single-char arg: stays on input line
 
     (ghostel--navigate-next-prompt 1)
-    (should (looking-at "cmd3"))                           ; next-prompt lands on cmd3
+    (should (eolp))                            ; empty prompt: cursor right after `$ '
 
-    (ghostel--navigate-previous-prompt 1)
-    (should (looking-at "cmd2"))                           ; previous-prompt lands on cmd2
-
+    ;; Backward navigation from end of buffer.
     (goto-char (point-max))
     (ghostel--navigate-previous-prompt 1)
-    (should (looking-at "cmd3"))                           ; previous from end lands on cmd3
+    (should (eolp))                            ; previous from EoB → empty current prompt
 
-    ;; From inside a prompt, previous should skip to the prior prompt
-    (goto-char (point-min))
-    (ghostel--navigate-next-prompt 1)       ; prompt 2
-    (ghostel--navigate-next-prompt 1)       ; prompt 3
-    (forward-char 1)                       ; inside prompt 3's command
     (ghostel--navigate-previous-prompt 1)
-    (should (looking-at "cmd2"))))                         ; previous from inside prompt lands on cmd2
+    (should (looking-at "echo b$"))            ; single-char arg
+
+    (ghostel--navigate-previous-prompt 1)
+    (should (looking-at "echo bb cc"))         ; multi-word
+
+    (ghostel--navigate-previous-prompt 1)
+    (should (looking-at "cmd1"))               ; first prompt
+
+    ;; From inside a prompt, previous should skip to the prior prompt.
+    (goto-char (point-min))
+    (ghostel--navigate-next-prompt 2)          ; on `echo b' input
+    (forward-char 2)                           ; inside the input
+    (ghostel--navigate-previous-prompt 1)
+    (should (looking-at "echo bb cc"))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: resize during sync output (alt screen)
