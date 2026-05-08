@@ -6327,6 +6327,83 @@ so an Emacs-driven drift is treated as drift, not a scroll."
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-redraw-resize-preserves-scrollback-jump ()
+  "Resize redraw must NOT re-anchor a window whose point is in scrollback.
+Regression test: consult-line / consult-imenu / plain `goto-char' jumps in
+line mode opened a minibuffer that resized the body twice.  The second
+resize fired with `ghostel--scroll-positions' empty (no scroll-tracking
+redraw ran while the minibuffer was open) and the predicate's
+resize-active branch classified the window as anchored, yanking
+`window-point' back to the live cursor.
+
+The fix is a `window-point' >= anchor guard on the resize branch:
+it preserves the drifted-ws case (`window-point' still in the live
+viewport) but rejects this case (`window-point' moved into scrollback)."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-scrollback-jump*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "row-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (set-window-buffer (selected-window) buf)
+            ;; Steady-state: cursor at live viewport, window anchored.
+            (goto-char (point-max))
+            (set-window-point (selected-window) (point-max))
+            (let ((vp (save-excursion
+                        (goto-char (point-max))
+                        (forward-line -9)
+                        (line-beginning-position))))
+              (set-window-start (selected-window) vp t))
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (should ghostel--last-anchor-position)
+            (should-not ghostel--scroll-positions)
+
+            ;; Simulate consult-line jumping point into scrollback.
+            (let ((target (save-excursion
+                            (goto-char (point-min))
+                            (forward-line 5)
+                            (line-beginning-position))))
+              (should (< target ghostel--last-anchor-position))
+              (set-window-point (selected-window) target)
+              (set-window-start (selected-window) target t)
+              (goto-char target)
+              ;; No plain redraw runs while the minibuffer is open, so
+              ;; `ghostel--scroll-positions' stays empty — exactly the
+              ;; state the resize-active branch used to misclassify.
+              (should-not ghostel--scroll-positions)
+
+              ;; Resize fires when the minibuffer closes.
+              (cl-letf (((default-value 'window-adjust-process-window-size-function)
+                         (lambda (&rest _) (cons 40 6)))
+                        ((symbol-function 'set-process-window-size) #'ignore))
+                (setq ghostel--process
+                      (make-pipe-process :name "ghostel-test-fake"
+                                         :buffer buf
+                                         :noquery t
+                                         :filter #'ignore
+                                         :sentinel #'ignore))
+                (unwind-protect
+                    (ghostel--window-adjust-process-window-size
+                     ghostel--process
+                     (list (selected-window)))
+                  (delete-process ghostel--process)
+                  (setq ghostel--process nil)))
+
+              ;; Window-point must still be in scrollback, not yanked
+              ;; back to the live viewport.
+              (should (< (window-point (selected-window))
+                         (ghostel--viewport-start))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-viewport-start-skips-trailing-newline ()
   "`ghostel--viewport-start' must not be off-by-one on a trailing \\n.
 Partial redraws can leave the buffer ending with \\n (e.g. after

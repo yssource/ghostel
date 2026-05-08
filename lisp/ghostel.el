@@ -5390,12 +5390,24 @@ remain handled inside the renderer."
 A window counts as anchored when `ghostel--snap-requested' is set
 \(the user just typed), when WIN is in `ghostel--windows-needing-snap'
 \(WIN just gained this buffer), when no anchor has been recorded yet
-\(first redraw), or when its `window-start' is at or past the prior
-anchor.  During a resize-triggered redraw, a window absent from
-`ghostel--scroll-positions' also counts as anchored: the prior redraw
-left it following the viewport, so a drifted `window-start' below the
-anchor is Emacs redisplay (e.g. `keep-point-visible' when the
-minibuffer shrinks the window), not a user scroll."
+\(first redraw), or when BOTH its `window-start' and `window-point'
+are at or past the prior anchor.  During a resize-triggered redraw,
+a window absent from `ghostel--scroll-positions' whose `window-point'
+is still at or past the anchor also counts as anchored: the prior
+redraw left it following the viewport, and a drifted `window-start'
+below the anchor is Emacs redisplay (e.g. `keep-point-visible' when
+the minibuffer shrinks the window), not a user scroll.  The
+`window-point' guard on the resize branch matters because consult-line
+and friends open and close a minibuffer that resizes the body twice;
+without it, the second resize would re-anchor a window whose point
+the user had moved into scrollback during the preview.
+
+The `window-point' check fixes the case where navigation moves
+point into scrollback without moving `window-start' — `consult-line',
+`consult-imenu', `goto-char' from a command, etc.  Without it,
+those jumps would be misclassified as \"following the cursor\" and
+the next redraw would yank point back to the live cursor.  Typing
+is unaffected because `ghostel--snap-requested' short-circuits."
   (let ((anchor ghostel--last-anchor-position))
     ;; Snap-requested (the user just typed) overrides Emacs mode's
     ;; usual no-anchor behaviour so typing forwards the keystroke
@@ -5407,8 +5419,10 @@ minibuffer shrinks the window), not a user scroll."
         (memq win ghostel--windows-needing-snap)
         (and (not (eq ghostel--input-mode 'emacs))
              (or (null anchor)
-                 (>= (window-start win) anchor)
+                 (and (>= (window-start win) anchor)
+                      (>= (window-point win) anchor))
                  (and ghostel--redraw-resize-active
+                      (>= (window-point win) anchor)
                       (not (assq win ghostel--scroll-positions))))))))
 
 (defun ghostel--capture-window-state (win)
