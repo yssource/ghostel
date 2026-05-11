@@ -582,6 +582,16 @@ per-redraw scan stays cheap."
 When absent, the match is linkified as a bare file/directory
 reference opened at its start.")
 
+(defcustom ghostel-module-directory nil
+  "Directory holding the ghostel native module.
+When nil (the default), the module is read from and written to the
+ghostel package directory.  Set this to a path outside your package
+manager's tree (for example, \"~/.config/emacs/ghostel/\") so that
+rebuilds or re-installs by the package manager do not delete or
+overwrite the module file while Emacs has it loaded."
+  :type '(choice (const :tag "Use package directory" nil)
+                 (directory :tag "Custom directory")))
+
 (defcustom ghostel-module-auto-install 'ask
   "What to do when the native module is missing at first interactive use.
 This setting is consulted only when the user invokes an interactive
@@ -926,6 +936,7 @@ Returns non-nil on success."
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
+          (make-directory dir t)
           (let ((dest (expand-file-name
                        (concat "ghostel-module" module-file-suffix) dir)))
             (message "ghostel: downloading native module from %s..." url)
@@ -936,26 +947,38 @@ Returns non-nil on success."
      (message "ghostel: download failed: %s" (error-message-string err))
      nil)))
 
-(defun ghostel--compile-module (dir)
-  "Compile the native module from source in DIR.
-Runs synchronously and returns non-nil on success."
-  (let ((default-directory dir))
+(defun ghostel--compile-module (dest-dir)
+  "Compile the native module from source and install it in DEST-DIR.
+The build runs in `ghostel--resource-root' (which holds build.zig);
+on success the produced module is renamed into DEST-DIR."
+  (let* ((source-dir (ghostel--resource-root))
+         (default-directory source-dir))
     (message "ghostel: compiling native module with zig build (this may take a moment)...")
     (condition-case err
         (let ((ret (process-file "zig" nil "*ghostel-build*" nil
                                  "build" "-Doptimize=ReleaseFast" "-Dcpu=baseline")))
-          (if (eq ret 0)
-              (progn (message "ghostel: native module compiled successfully") t)
-            (display-warning 'ghostel
-                             "Module compilation failed.  See *ghostel-build* buffer for details.")
-            nil))
+          (if (not (eq ret 0))
+              (display-warning 'ghostel
+                               "Module compilation failed.  See *ghostel-build* buffer for details.")
+            (let* ((file-name (concat "ghostel-module" module-file-suffix))
+                   (built (expand-file-name file-name source-dir))
+                   (final (expand-file-name file-name dest-dir)))
+              (cond
+               ((not (file-exists-p built))
+                (display-warning 'ghostel
+                                 (format "Build succeeded but module not produced at %s"
+                                         built)))
+               ((equal built final)
+                (message "ghostel: native module compiled successfully"))
+               (t
+                (make-directory dest-dir t)
+                (rename-file built final t)
+                (message "ghostel: native module compiled successfully"))))))
       (file-missing
        (display-warning 'ghostel
-                        (format "zig executable not found while compiling in %s" dir))
-       nil)
+                        (format "zig executable not found while compiling in %s" source-dir)))
       (error
-       (display-warning 'ghostel (error-message-string err))
-       nil))))
+       (display-warning 'ghostel (error-message-string err))))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -1000,10 +1023,18 @@ Choice: " url)
       (?s nil))))
 
 (defun ghostel--download-file (url dest)
-  "Download URL to DEST.  Return non-nil on success."
-  (condition-case nil
-      (let ((url-request-method "GET")
-            (url-show-status nil))
+  "Download URL to DEST atomically.  Return non-nil on success.
+Writes to a sibling temp file in the same directory and renames it
+into place once the download succeeds.  Renaming swaps the directory
+entry to a new inode, so any process (notably a running Emacs) that
+has the previous DEST file mmap'd keeps a valid mapping to the old
+file content.  Writing to DEST directly would truncate the existing
+inode and corrupt that mapping."
+  (let* ((url-request-method "GET")
+         (url-show-status nil)
+         (tmp (make-temp-name (concat dest ".tmp.")))
+         (ok nil))
+    (unwind-protect
         (let ((buf (url-retrieve-synchronously url t t 30)))
           (when buf
             (unwind-protect
@@ -1015,12 +1046,16 @@ Choice: " url)
                       (let ((coding-system-for-write 'binary)
                             (start (point)))
                         (when (< start (point-max))
-                          (write-region start (point-max) dest nil 'silent)
-                          (set-file-modes dest #o755)
-                          t)))))
+                          (write-region start (point-max) tmp nil 'silent)
+                          (set-file-modes tmp #o755)
+                          (rename-file tmp dest t)
+                          (setq ok t))))))
               (when (buffer-live-p buf)
-                (kill-buffer buf))))))
-    (error nil)))
+                (kill-buffer buf)))))
+      (unless ok
+        (when (file-exists-p tmp)
+          (ignore-errors (delete-file tmp)))))
+    ok))
 
 (defun ghostel--package-directory ()
   "Return the directory ghostel is loaded from, or nil."
@@ -1046,12 +1081,20 @@ shipped resources), so callers always get a sensible
           (and (file-directory-p (expand-file-name "etc" parent)) parent))
         lisp-dir)))
 
+(defun ghostel--module-directory ()
+  "Return the absolute directory where the native module lives.
+Honours `ghostel-module-directory' when set, otherwise falls back to
+the shipped resource root."
+  (when-let* ((dir (or ghostel-module-directory
+                       (ghostel--resource-root))))
+    (file-name-as-directory (expand-file-name dir))))
+
 (defun ghostel-download-module (&optional prompt-for-version)
   "Interactively download the pre-built native module for this platform.
 With PROMPT-FOR-VERSION, prompt for a release tag to download.
 Leaving the prompt empty downloads the latest release."
   (interactive "P")
-  (let* ((dir (ghostel--resource-root))
+  (let* ((dir (ghostel--module-directory))
          (mod (expand-file-name
                (concat "ghostel-module" module-file-suffix) dir))
          (version (when prompt-for-version
@@ -1067,12 +1110,47 @@ Leaving the prompt empty downloads the latest release."
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
+(defun ghostel--install-built-module-on-finish (compile-buf source-dir dest-dir)
+  "Move the built module from SOURCE-DIR into DEST-DIR when COMPILE-BUF finishes.
+Registers a one-shot `compilation-finish-functions' handler that
+filters on COMPILE-BUF and removes itself on first match.  Used so the
+interactive `ghostel-module-compile' honours `ghostel-module-directory'."
+  (let* ((file-name (concat "ghostel-module" module-file-suffix))
+         handler)
+    (setq handler
+          (lambda (buf status)
+            (when (eq buf compile-buf)
+              (remove-hook 'compilation-finish-functions handler)
+              (when (string-match-p "finished" status)
+                (let ((built (expand-file-name file-name source-dir))
+                      (final (expand-file-name file-name dest-dir)))
+                  (when (file-exists-p built)
+                    (condition-case err
+                        (progn
+                          (make-directory dest-dir t)
+                          (rename-file built final t)
+                          (message "ghostel: module installed at %s" final))
+                      (error
+                       (display-warning
+                        'ghostel
+                        (format "Build succeeded but moving %s to %s failed: %s"
+                                built final (error-message-string err)))))))))))
+    (add-hook 'compilation-finish-functions handler)))
+
 (defun ghostel-module-compile ()
   "Compile the ghostel native module by running zig build.
-The output is shown in a *ghostel-build* compilation buffer."
+The output is shown in a `*compilation*' buffer.  When
+`ghostel-module-directory' points outside the package tree, the
+produced module is moved into that directory once the build
+finishes."
   (interactive)
-  (let ((default-directory (ghostel--resource-root)))
-    (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
+  (let* ((source-dir (ghostel--resource-root))
+         (dest-dir (ghostel--module-directory))
+         (default-directory source-dir)
+         (compile-buf (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
+    (unless (equal (file-name-as-directory (expand-file-name source-dir))
+                   (file-name-as-directory (expand-file-name dest-dir)))
+      (ghostel--install-built-module-on-finish compile-buf source-dir dest-dir))))
 
 
 (defun ghostel--check-module-version (dir &optional prompt-user)
@@ -1110,7 +1188,7 @@ covers the pure-Elisp test path where `cl-letf' stubs the native
 entry points so tests run without the module present."
   (unless (or (featurep 'ghostel-module)
               (fboundp 'ghostel--new))
-    (let* ((dir (ghostel--resource-root))
+    (let* ((dir (ghostel--module-directory))
            (mod (expand-file-name
                  (concat "ghostel-module" module-file-suffix) dir)))
       (when (and prompt-user (not (file-exists-p mod)))

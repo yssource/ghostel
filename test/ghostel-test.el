@@ -8615,14 +8615,172 @@ hand nil to the native module."
         (should (null captured-version))
         (should captured-latest)))))
 
+(ert-deftest ghostel-test-download-file-is-atomic ()
+  "`ghostel--download-file' writes via a temp sibling and renames into place.
+The destination inode must change so any Emacs that has the previous
+file mmap'd keeps a valid mapping (issue #247)."
+  (let* ((dir (make-temp-file "ghostel-dl-" t))
+         (dest (expand-file-name "ghostel-module.so" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file dest (insert "old-payload"))
+          (set-file-modes dest #o644)
+          (let ((old-inode (file-attribute-inode-number (file-attributes dest))))
+            (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                       (lambda (&rest _)
+                         (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                           (with-current-buffer buf
+                             (set-buffer-multibyte nil)
+                             (insert "HTTP/1.1 200 OK\r\n\r\nnew-payload"))
+                           buf))))
+              (should (ghostel--download-file "https://example.invalid/x" dest)))
+            (should (equal "new-payload"
+                           (with-temp-buffer
+                             (set-buffer-multibyte nil)
+                             (insert-file-contents-literally dest)
+                             (buffer-string))))
+            (let ((new-inode (file-attribute-inode-number (file-attributes dest))))
+              (should-not (equal old-inode new-inode)))
+            ;; No stale temp files left behind on success.
+            (dolist (f (directory-files dir nil "\\." t))
+              (should-not (string-match-p "\\.tmp\\." f)))))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-download-module-creates-missing-directory ()
+  "`ghostel--download-module' creates DIR before writing the module.
+Regression for the auto-install path: setting `ghostel-module-directory'
+to a path that does not yet exist used to fail silently because the
+temp-file write under that directory errored out."
+  (let* ((parent (make-temp-file "ghostel-dl-parent-" t))
+         (dir (expand-file-name "sub/dir/" parent))
+         (asset "ghostel-module-x86_64-linux.so"))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p dir))
+          (cl-letf (((symbol-function 'ghostel--module-asset-name)
+                     (lambda () asset))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _)
+                       (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                         (with-current-buffer buf
+                           (set-buffer-multibyte nil)
+                           (insert "HTTP/1.1 200 OK\r\n\r\npayload"))
+                         buf))))
+            (should (ghostel--download-module dir nil t)))
+          (should (file-directory-p dir))
+          (should (file-exists-p (expand-file-name
+                                  (concat "ghostel-module" module-file-suffix)
+                                  dir))))
+      (when (file-exists-p parent)
+        (delete-directory parent t)))))
+
+(ert-deftest ghostel-test-download-file-cleans-up-on-failure ()
+  "A failed HTTP response leaves no stale temp file behind."
+  (let* ((dir (make-temp-file "ghostel-dl-" t))
+         (dest (expand-file-name "ghostel-module.so" dir)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _)
+                       (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                         (with-current-buffer buf
+                           (set-buffer-multibyte nil)
+                           (insert "HTTP/1.1 404 Not Found\r\n\r\nnope"))
+                         buf))))
+            (should-not (ghostel--download-file "https://example.invalid/x" dest)))
+          (should-not (file-exists-p dest))
+          (dolist (f (directory-files dir nil "\\." t))
+            (should-not (string-match-p "\\.tmp\\." f))))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-module-directory-defaults-to-resource-root ()
+  "When `ghostel-module-directory' is nil, the resource root is used."
+  (let ((ghostel-module-directory nil))
+    (cl-letf (((symbol-function 'ghostel--resource-root)
+               (lambda () "/pkg/ghostel/")))
+      (should (equal (downcase (file-name-as-directory
+                                (expand-file-name "/pkg/ghostel/")))
+                     (downcase (ghostel--module-directory)))))))
+
+(ert-deftest ghostel-test-module-directory-honours-custom-value ()
+  "When set, `ghostel-module-directory' takes precedence."
+  (let ((ghostel-module-directory "~/custom/ghostel/"))
+    (cl-letf (((symbol-function 'ghostel--resource-root)
+               (lambda () "/pkg/ghostel/")))
+      (should (equal (downcase (file-name-as-directory
+                                (expand-file-name "~/custom/ghostel/")))
+                     (downcase (ghostel--module-directory)))))))
+
+(ert-deftest ghostel-test-download-module-targets-custom-directory ()
+  "Interactive download writes into `ghostel-module-directory' when set."
+  (let ((ghostel-module-directory "/custom/dir/")
+        (captured-dir nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/pkg/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'make-directory)
+                 (lambda (&rest _)))
+                ((symbol-function 'ghostel--read-module-download-version)
+                 (lambda () nil))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (dir &optional _v _l)
+                   (setq captured-dir dir)
+                   (throw 'ghostel-test-bail nil)))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (catch 'ghostel-test-bail
+          (ghostel-download-module nil))
+        (should (equal (downcase (file-name-as-directory
+                                  (expand-file-name "/custom/dir/")))
+                       (downcase captured-dir)))))))
+
+(ert-deftest ghostel-test-load-module-looks-in-custom-directory ()
+  "`ghostel--load-module' loads the module from `ghostel-module-directory'."
+  (let* ((ghostel-module-directory "/custom/dir/")
+         (loaded-path nil)
+         (had-feat (featurep 'ghostel-module))
+         (saved-new (and (fboundp 'ghostel--new)
+                         (symbol-function 'ghostel--new))))
+    (unwind-protect
+        (progn
+          (when had-feat
+            (setq features (delq 'ghostel-module features)))
+          (when saved-new
+            (fmakunbound 'ghostel--new))
+          (cl-letf (((symbol-function 'ghostel--resource-root)
+                     (lambda () "/pkg/ghostel/"))
+                    ((symbol-function 'file-exists-p)
+                     (lambda (path)
+                       (string-prefix-p (expand-file-name "/custom/dir/") path)))
+                    ((symbol-function 'module-load)
+                     (lambda (path) (setq loaded-path path)))
+                    ((symbol-function 'ghostel--check-module-version)
+                     (lambda (&rest _))))
+            (ghostel--load-module)))
+      (when saved-new
+        (fset 'ghostel--new saved-new))
+      (when had-feat
+        (cl-pushnew 'ghostel-module features)))
+    (should loaded-path)
+    (should (string-prefix-p (expand-file-name "/custom/dir/")
+                             loaded-path))))
+
 (ert-deftest ghostel-test-compile-module-invokes-zig-build ()
-  "Source compilation runs zig build directly."
+  "Source compilation runs zig build in the resource root."
   (let ((default-directory nil)
         (messages nil)
         (warnings nil)
         (process-invocation nil))
     (let ((native-comp-enable-subr-trampolines nil))
-      (cl-letf (((symbol-function 'message)
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "C:/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) t))
+                ((symbol-function 'message)
                  (lambda (fmt &rest args)
                    (push (apply #'format fmt args) messages)))
                 ((symbol-function 'display-warning)
@@ -8633,28 +8791,135 @@ hand nil to the native module."
                    (setq process-invocation
                          (list program infile buffer display args default-directory))
                    0)))
-        (should (ghostel--compile-module "C:/ghostel/"))
+        (ghostel--compile-module "C:/ghostel/")
         (should (equal
                  '("zig" nil "*ghostel-build*" nil ("build" "-Doptimize=ReleaseFast" "-Dcpu=baseline") "C:/ghostel/")
                  process-invocation))
         (should-not warnings)))))
 
+(ert-deftest ghostel-test-compile-module-moves-to-dest-dir ()
+  "Compilation moves the produced module into DEST-DIR when it differs."
+  (let ((rename-args nil)
+        (made-dirs nil)
+        (warnings nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) t))
+                ((symbol-function 'make-directory)
+                 (lambda (dir &rest _) (push dir made-dirs)))
+                ((symbol-function 'rename-file)
+                 (lambda (from to &optional _ok)
+                   (push (list from to) rename-args)))
+                ((symbol-function 'message) (lambda (&rest _)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings)))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) 0)))
+        (ghostel--compile-module "/custom/dir/")
+        (should-not warnings)
+        (should (equal 1 (length rename-args)))
+        (let ((args (car rename-args)))
+          (should (equal (downcase (expand-file-name
+                                    (concat "ghostel-module" module-file-suffix)
+                                    "/src/ghostel/"))
+                         (downcase (nth 0 args))))
+          (should (equal (downcase (expand-file-name
+                                    (concat "ghostel-module" module-file-suffix)
+                                    "/custom/dir/"))
+                         (downcase (nth 1 args)))))
+        (should (member "/custom/dir/" made-dirs))))))
+
+(ert-deftest ghostel-test-compile-module-warns-when-build-missing ()
+  "When the build returns success but no module file appears, warn."
+  (let ((warnings nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'message) (lambda (&rest _)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings)))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) 0)))
+        (ghostel--compile-module "/src/ghostel/")
+        (should warnings)))))
+
 (ert-deftest ghostel-test-module-compile-command-uses-zig-build ()
   "Interactive compilation uses zig build directly."
   (let ((compile-invocation nil)
-        (default-directory nil))
+        (default-directory nil)
+        (ghostel-module-directory nil))
     (let ((native-comp-enable-subr-trampolines nil))
-      (cl-letf (((symbol-function 'locate-library)
-                 (lambda (_) "C:/ghostel/ghostel.el"))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "C:/ghostel/"))
                 ((symbol-function 'compile)
                  (lambda (command &optional comint)
-                   (setq compile-invocation (list command comint default-directory)))))
+                   (setq compile-invocation (list command comint default-directory))
+                   (current-buffer))))
         (ghostel-module-compile)
         (should (equal "zig build -Doptimize=ReleaseFast -Dcpu=baseline"
                        (nth 0 compile-invocation)))
         (should (eq t (nth 1 compile-invocation)))
         (should (equal (downcase "C:/ghostel/")
                        (downcase (nth 2 compile-invocation))))))))
+
+(ert-deftest ghostel-test-module-compile-installs-when-dest-differs ()
+  "Interactive compile installs the built module into `ghostel-module-directory'.
+A `compilation-finish-functions' handler renames the artifact when
+the dest directory differs from the source root."
+  (let* ((compile-buf (generate-new-buffer " *ghostel-test-compile*"))
+         (compilation-finish-functions nil)
+         (rename-args nil)
+         (made-dirs nil)
+         (default-directory nil)
+         (ghostel-module-directory "/custom/dir/"))
+    (unwind-protect
+        (let ((native-comp-enable-subr-trampolines nil))
+          (cl-letf (((symbol-function 'ghostel--resource-root)
+                     (lambda () "/src/ghostel/"))
+                    ((symbol-function 'compile)
+                     (lambda (&rest _) compile-buf))
+                    ((symbol-function 'file-exists-p)
+                     (lambda (_) t))
+                    ((symbol-function 'make-directory)
+                     (lambda (dir &rest _) (push dir made-dirs)))
+                    ((symbol-function 'rename-file)
+                     (lambda (from to &optional _ok)
+                       (push (list from to) rename-args)))
+                    ((symbol-function 'message) (lambda (&rest _))))
+            (ghostel-module-compile)
+            (should (equal 1 (length compilation-finish-functions)))
+            ;; Simulate compilation completion.
+            (funcall (car compilation-finish-functions) compile-buf "finished\n")
+            (should (null compilation-finish-functions))
+            (should (equal 1 (length rename-args)))
+            (let ((args (car rename-args)))
+              (should (equal (downcase (expand-file-name
+                                        (concat "ghostel-module" module-file-suffix)
+                                        "/src/ghostel/"))
+                             (downcase (nth 0 args))))
+              (should (equal (downcase (expand-file-name
+                                        (concat "ghostel-module" module-file-suffix)
+                                        "/custom/dir/"))
+                             (downcase (nth 1 args)))))))
+      (when (buffer-live-p compile-buf)
+        (kill-buffer compile-buf)))))
+
+(ert-deftest ghostel-test-module-compile-no-install-when-dest-same ()
+  "When dest matches source, no finish handler is registered."
+  (let ((compilation-finish-functions nil)
+        (default-directory nil)
+        (ghostel-module-directory nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'compile)
+                 (lambda (&rest _) (current-buffer))))
+        (ghostel-module-compile)
+        (should (null compilation-finish-functions))))))
 
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
@@ -14111,12 +14376,23 @@ slip past the unit tests."
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build
+    ghostel-test-compile-module-moves-to-dest-dir
+    ghostel-test-compile-module-warns-when-build-missing
     ghostel-test-module-compile-command-uses-zig-build
+    ghostel-test-module-compile-installs-when-dest-differs
+    ghostel-test-module-compile-no-install-when-dest-same
     ghostel-test-module-download-url-uses-requested-version
     ghostel-test-module-download-url-uses-latest-release
     ghostel-test-download-module-defaults-to-minimum-version
     ghostel-test-download-module-prefix-uses-requested-version
     ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-file-is-atomic
+    ghostel-test-download-file-cleans-up-on-failure
+    ghostel-test-download-module-creates-missing-directory
+    ghostel-test-module-directory-defaults-to-resource-root
+    ghostel-test-module-directory-honours-custom-value
+    ghostel-test-download-module-targets-custom-directory
+    ghostel-test-load-module-looks-in-custom-directory
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
