@@ -2686,7 +2686,8 @@ returns to whichever input mode was active before."
       (pcase target
         ('char  (ghostel-char-mode))
         ('emacs (ghostel-emacs-mode))
-        (_      (ghostel-semi-char-mode))))
+        (_      (ghostel-semi-char-mode)))
+      (ghostel-force-redraw))
     (message "Read-only mode exited")))
 
 (defun ghostel-readonly-exit-and-clear ()
