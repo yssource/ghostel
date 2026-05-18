@@ -674,7 +674,9 @@ omit it when the connection itself is the suspected fault."
                     shell ghostel-shell
                     shell-integ ghostel-shell-integration
                     tramp-integ ghostel-tramp-shell-integration
-                    detected (ghostel--detect-shell ghostel-shell)
+                    detected (ghostel--detect-shell
+                              (car (ghostel--shell-program-and-args
+                                    ghostel-shell)))
                     term ghostel--term
                     term-rows ghostel--term-rows
                     term-cols ghostel--term-cols

@@ -13210,6 +13210,189 @@ External packages may still call the old internal name."
         (ghostel-shell "/bin/zsh"))
     (should (equal "/bin/zsh" (ghostel--get-shell)))))
 
+(ert-deftest ghostel-test-shell-program-and-args-string ()
+  "String SPEC splits into (PROGRAM . nil)."
+  (should (equal '("/bin/zsh") (ghostel--shell-program-and-args "/bin/zsh"))))
+
+(ert-deftest ghostel-test-shell-program-and-args-list ()
+  "List SPEC splits into (PROGRAM . ARGS)."
+  (let ((split (ghostel--shell-program-and-args '("/bin/zsh" "--login" "-i"))))
+    (should (equal "/bin/zsh" (car split)))
+    (should (equal '("--login" "-i") (cdr split)))))
+
+(ert-deftest ghostel-test-shell-program-and-args-invalid ()
+  "Invalid SPEC signals an error."
+  (should-error (ghostel--shell-program-and-args 42))
+  (should-error (ghostel--shell-program-and-args nil))
+  (should-error (ghostel--shell-program-and-args '()))
+  (should-error (ghostel--shell-program-and-args '(nil "foo"))))
+
+(ert-deftest ghostel-test-get-shell-local-returns-program-from-list ()
+  "When `ghostel-shell' is a list, `ghostel--get-shell' returns just the program."
+  (let ((default-directory "/tmp/")
+        (ghostel-shell '("/bin/zsh" "--login")))
+    (should (equal "/bin/zsh" (ghostel--get-shell)))))
+
+(ert-deftest ghostel-test-macos-login-wrap-basic ()
+  "Login wrap produces /usr/bin/login + bash shim with exec -l <prog>."
+  (cl-letf (((symbol-function 'user-login-name) (lambda () "alice"))
+            ((symbol-function 'file-exists-p) (lambda (_) nil)))
+    (let* ((wrap (ghostel--macos-login-wrap "/bin/zsh" nil))
+           (program (car wrap))
+           (args (cdr wrap)))
+      (should (equal "/usr/bin/login" program))
+      ;; No -q without hushlogin.
+      (should-not (member "-q" args))
+      (should (equal "-flp" (nth 0 args)))
+      (should (equal "alice" (nth 1 args)))
+      (should (equal "/bin/bash" (nth 2 args)))
+      (should (equal "--noprofile" (nth 3 args)))
+      (should (equal "--norc" (nth 4 args)))
+      (should (equal "-c" (nth 5 args)))
+      ;; exec -l <quoted-program>; no extra args.
+      (should (equal "exec -l /bin/zsh" (nth 6 args))))))
+
+(ert-deftest ghostel-test-macos-login-wrap-hushlogin ()
+  "When ~/.hushlogin exists, -q is prepended."
+  (let ((hush-path (expand-file-name "~/.hushlogin")))
+    (cl-letf (((symbol-function 'user-login-name) (lambda () "alice"))
+              ((symbol-function 'file-exists-p)
+               (lambda (p) (equal p hush-path))))
+      (let* ((wrap (ghostel--macos-login-wrap "/bin/zsh" nil))
+             (args (cdr wrap)))
+        (should (equal "-q" (nth 0 args)))
+        (should (equal "-flp" (nth 1 args)))
+        (should (equal "alice" (nth 2 args)))))))
+
+(ert-deftest ghostel-test-macos-login-wrap-extra-args ()
+  "Extra ARGS are shell-quoted into the `exec -l' command string."
+  (cl-letf (((symbol-function 'user-login-name) (lambda () "alice"))
+            ((symbol-function 'file-exists-p) (lambda (_) nil)))
+    (let* ((wrap (ghostel--macos-login-wrap "/bin/bash" '("--login" "--posix")))
+           (cmd (nth 6 (cdr wrap))))
+      (should (equal "exec -l /bin/bash --login --posix" cmd)))))
+
+(defmacro ghostel-test--with-spawn-capture (capture &rest body)
+  "Bind CAPTURE to the (PROGRAM . ARGS) cons passed to `ghostel--spawn-pty'.
+Stubs out `ghostel--spawn-pty' so no real process is spawned.  BODY
+runs with the stub in place."
+  (declare (indent 1))
+  `(let (,capture)
+     (cl-letf (((symbol-function 'ghostel--spawn-pty)
+                (lambda (program args &rest _)
+                  (setq ,capture (cons program args))
+                  nil)))
+       ,@body)))
+
+(ert-deftest ghostel-test-start-process-darwin-login-wrap ()
+  "On darwin with `ghostel-macos-login-shell', wrap shell via `/usr/bin/login'."
+  (cl-letf (((symbol-function 'user-login-name) (lambda () "alice"))
+            ((symbol-function 'file-exists-p) (lambda (_) nil)))
+    (ghostel-test--with-spawn-capture spawn
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 24
+                    ghostel--term-cols 80)
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/zsh")
+               (ghostel-shell-integration nil)
+               (ghostel-macos-login-shell t)
+               (system-type 'darwin)
+               (default-directory "/tmp/"))
+          (ghostel--start-process)
+          (should (equal "/usr/bin/login" (car spawn)))
+          (let ((args (cdr spawn)))
+            (should-not (member "-q" args))
+            (should (equal '("-flp" "alice"
+                             "/bin/bash" "--noprofile" "--norc"
+                             "-c" "exec -l /bin/zsh")
+                           args))))))))
+
+(ert-deftest ghostel-test-start-process-darwin-login-wrap-opt-out ()
+  "Setting `ghostel-macos-login-shell' to nil disables the wrap on darwin."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-shell "/bin/zsh")
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell nil)
+             (system-type 'darwin)
+             (default-directory "/tmp/"))
+        (ghostel--start-process)
+        (should (equal "/bin/zsh" (car spawn)))
+        (should (null (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-non-darwin-no-login-wrap ()
+  "Login wrap is not applied on non-Darwin platforms even when opted in."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-shell "/bin/zsh")
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell t)
+             (system-type 'gnu/linux)
+             (default-directory "/tmp/"))
+        (ghostel--start-process)
+        (should (equal "/bin/zsh" (car spawn)))
+        (should (null (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-list-shell-passes-args ()
+  "When `ghostel-shell' is a list, extra args reach `ghostel--spawn-pty'."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-shell '("/bin/zsh" "--login"))
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell nil)
+             (system-type 'gnu/linux)
+             (default-directory "/tmp/"))
+        (ghostel--start-process)
+        (should (equal "/bin/zsh" (car spawn)))
+        (should (equal '("--login") (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-list-shell-combines-with-integration ()
+  "List shell args combine with bash integration's `--posix' arg."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-shell '("/bin/bash" "--login"))
+             (ghostel-shell-integration t)
+             (ghostel-macos-login-shell nil)
+             (system-type 'gnu/linux)
+             (default-directory "/tmp/"))
+        (ghostel--start-process)
+        (should (equal "/bin/bash" (car spawn)))
+        ;; Extra args precede integration args.
+        (should (equal '("--login" "--posix") (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-darwin-login-wrap-with-integration ()
+  "Wrap + list shell + bash integration: all three layers compose correctly."
+  (cl-letf (((symbol-function 'user-login-name) (lambda () "alice"))
+            ((symbol-function 'file-exists-p) (lambda (_) nil)))
+    (ghostel-test--with-spawn-capture spawn
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 24
+                    ghostel--term-cols 80)
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell '("/bin/bash" "--login"))
+               (ghostel-shell-integration t)
+               (ghostel-macos-login-shell t)
+               (system-type 'darwin)
+               (default-directory "/tmp/"))
+          (ghostel--start-process)
+          (should (equal "/usr/bin/login" (car spawn)))
+          (should (equal '("-flp" "alice"
+                           "/bin/bash" "--noprofile" "--norc"
+                           "-c" "exec -l /bin/bash --login --posix")
+                         (cdr spawn))))))))
+
 (ert-deftest ghostel-test-start-process-sets-size-via-stty-not-env ()
   "Initial terminal size must be baked into the `stty' wrapper, not env vars.
 Setting `LINES'/`COLUMNS' env vars freezes ncurses apps like htop at
@@ -13688,6 +13871,10 @@ integration script runs, so input echo must be enabled before exec.
         (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
                (ghostel-shell "/bin/bash")
                (ghostel-shell-integration t)
+               ;; Pin the wrap off so the assertion targets the un-nested
+               ;; `exec /bin/bash --posix' form.  Login-wrap behavior is
+               ;; covered by its own dedicated tests.
+               (ghostel-macos-login-shell nil)
                (default-directory "/tmp/")
                (proc (ghostel--start-process)))
           (unwind-protect
@@ -15337,6 +15524,19 @@ slip past the unit tests."
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
+    ghostel-test-shell-program-and-args-string
+    ghostel-test-shell-program-and-args-list
+    ghostel-test-shell-program-and-args-invalid
+    ghostel-test-get-shell-local-returns-program-from-list
+    ghostel-test-macos-login-wrap-basic
+    ghostel-test-macos-login-wrap-hushlogin
+    ghostel-test-macos-login-wrap-extra-args
+    ghostel-test-start-process-darwin-login-wrap
+    ghostel-test-start-process-darwin-login-wrap-opt-out
+    ghostel-test-start-process-non-darwin-no-login-wrap
+    ghostel-test-start-process-list-shell-passes-args
+    ghostel-test-start-process-list-shell-combines-with-integration
+    ghostel-test-start-process-darwin-login-wrap-with-integration
     ghostel-test-fish-auto-inject-loads-integration
     ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix
     ghostel-test-remote-term-preamble
