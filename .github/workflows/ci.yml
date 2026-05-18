@@ -26,11 +26,9 @@ jobs:
 
       - name: Byte-compile
         run: |
-          emacs --batch -Q -L /tmp/compat -L lisp \
-            --eval "(setq byte-compile-error-on-warn t)" \
-            -f batch-byte-compile \
-            lisp/ghostel.el lisp/ghostel-compile.el \
-            lisp/ghostel-debug.el lisp/ghostel-eshell.el
+          make -j$(getconf _NPROCESSORS_ONLN) \
+            EMACSFLAGS="-L /tmp/compat" \
+            byte-compile
 
   lint:
     runs-on: ubuntu-latest
@@ -92,11 +90,9 @@ jobs:
 
       - name: Run pure Elisp tests
         run: |
-          emacs --batch -Q -L /tmp/compat -L lisp -L test \
-            -l ert \
-            -l test/ghostel-test-helpers.el \
-            $(for f in test/ghostel-*-test.el; do printf -- '-l %s ' "$f"; done) \
-            -f ghostel-test-run-elisp
+          make -j$(getconf _NPROCESSORS_ONLN) \
+            EMACSFLAGS="-L /tmp/compat" \
+            test
 
   test-evil:
     runs-on: ubuntu-latest
@@ -208,13 +204,18 @@ jobs:
         with:
           name: ghostel-module-${{ matrix.platform }}
 
+      - name: Mark pre-built module as up-to-date
+        # The module was built in a prior job and its mtime predates the
+        # checkout, so make would consider it stale w.r.t. src/*.zig and
+        # try to re-invoke `zig build' (Zig isn't installed in this job).
+        # Touching the artifact pins the Make dependency.
+        run: touch ghostel-module${{ matrix.suffix }}
+
       - name: Install compat
         run: git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat
 
       - name: Run native module tests
         run: |
-          emacs --batch -Q -L /tmp/compat -L lisp -L test \
-            -l ert \
-            -l test/ghostel-test-helpers.el \
-            $(for f in test/ghostel-*-test.el; do printf -- '-l %s ' "$f"; done) \
-            -f ghostel-test-run-native
+          make -j$(getconf _NPROCESSORS_ONLN) \
+            EMACSFLAGS="-L /tmp/compat" \
+            test-native
