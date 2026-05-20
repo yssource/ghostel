@@ -278,6 +278,15 @@ or backing scale factor."
   :type '(choice (const :tag "Auto-detect from display DPI" auto)
                  (number :tag "Explicit ratio")))
 
+(defcustom ghostel-glyph-scale-floor 0.0
+  "Minimum scale for glyphs whose font metrics don't fit the cell.
+0.0 (default) preserves strict grid alignment.  1.0 disables
+shrinking entirely so CJK and other fallback glyphs render at
+natural size, potentially making rows slightly taller and cells slightly wider."
+  :type '(float 0.0 1.0)
+  :local t
+  :group 'ghostel)
+
 (defcustom ghostel-kitty-graphics-storage-limit (* 320 1024 1024)  ; 320 MiB
   "Kitty graphics image storage cap, in bytes, per terminal.
 
