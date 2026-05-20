@@ -6,7 +6,7 @@
 /// (viewport parking, scrollback sync, dirty-row reuse).
 const std = @import("std");
 const emacs = @import("emacs.zig");
-const gt = @import("ghostty.zig");
+const gt = @import("ghostty-vt");
 const Terminal = @import("terminal.zig");
 
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
@@ -15,12 +15,6 @@ const Self = @This();
 
 /// Render state for incremental screen updates.
 render_state: gt.RenderState,
-
-/// Reusable row iterator (populated during redraw).
-row_iterator: gt.RenderStateRowIterator,
-
-/// Reusable row cells handle (populated during redraw).
-row_cells: gt.RenderStateRowCells,
 
 /// Number of libghostty rows already materialized into the Emacs buffer. Polled
 /// on each redraw; kept in sync by appending newly-scrolled-off rows and
@@ -40,13 +34,7 @@ row: RowContent = .{},
 font_info: ?FontInfo = null,
 
 /// Bold text coloring configuration.
-bold_config: BoldConfig = .none,
-
-pub const BoldConfig = union(enum) {
-    none,
-    bright,
-    fixed: gt.ColorRgb,
-};
+bold_config: ?gt.Style.BoldColor = null,
 
 const FontInfo = struct {
     width: i64,
@@ -54,42 +42,28 @@ const FontInfo = struct {
     coverage: u32,
 };
 
-pub fn init(cols: u16, rows: u16) !Self {
-    var render_state: gt.RenderState = undefined;
-    if (gt.c.ghostty_render_state_new(null, &render_state) != gt.SUCCESS) {
-        return error.RenderStateCreateFailed;
-    }
-    errdefer gt.c.ghostty_render_state_free(render_state);
-
-    var row_iterator: gt.RenderStateRowIterator = undefined;
-    if (gt.c.ghostty_render_state_row_iterator_new(null, &row_iterator) != gt.SUCCESS) {
-        return error.RowIteratorCreateFailed;
-    }
-    errdefer gt.c.ghostty_render_state_row_iterator_free(row_iterator);
-
-    var row_cells: gt.RenderStateRowCells = undefined;
-    if (gt.c.ghostty_render_state_row_cells_new(null, &row_cells) != gt.SUCCESS) {
-        return error.RowCellsCreateFailed;
-    }
-    errdefer gt.c.ghostty_render_state_row_cells_free(row_cells);
-
-    return .{
-        .render_state = render_state,
-        .row_iterator = row_iterator,
-        .row_cells = row_cells,
-        .size = .{ .cols = cols, .rows = rows },
+pub fn init(term: *gt.Terminal) !Self {
+    var renderer = Self{
+        .render_state = gt.RenderState.empty,
+        .size = undefined,
+        .pending_resize = .{ .cols = term.cols, .rows = term.rows, .cell_w = 1, .cell_h = 1 },
     };
+    try renderer.commitResize(term);
+    return renderer;
 }
 
 pub fn deinit(self: *Self) void {
-    gt.c.ghostty_render_state_row_cells_free(self.row_cells);
-    gt.c.ghostty_render_state_row_iterator_free(self.row_iterator);
-    gt.c.ghostty_render_state_free(self.render_state);
+    self.render_state.deinit(std.heap.c_allocator);
     self.row.deinit();
 }
 
-pub fn resize(self: *Self, cols: u16, rows: u16) void {
-    self.pending_resize = .{ .cols = cols, .rows = rows };
+pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void {
+    self.pending_resize = .{
+        .cols = cols,
+        .rows = rows,
+        .cell_w = cell_w,
+        .cell_h = cell_h,
+    };
 }
 
 /// Redraw the terminal into the current Emacs buffer.
@@ -130,7 +104,7 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
         }
     }
 
-    const scrollbar = try term.getScrollbar();
+    const scrollbar = term.terminal.screens.active.pages.scrollbar();
 
     // If the font changed, the font metrics are no longer valid, so we rebuild.
     const font_changed = self.updateFontInfo(env);
@@ -153,7 +127,7 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     if (force_full_arg or font_changed or cols_changed or scrollbar_reset or scrollbar_hit_cap) {
         env.eraseBuffer();
         // Commit any pending resize since we're doing a rebuild anyway.
-        self.commitResize(term);
+        try self.commitResize(&term.terminal);
 
         self.rows_in_buffer = 0;
         force_full = true;
@@ -164,11 +138,11 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     // also where the Emacs buffer currently ends. When we have no scrollback
     // there was no parking, so go to the top instead.
     if (self.rows_in_buffer > self.size.rows) {
-        term.scrollViewport(gt.SCROLL_DELTA, 1);
+        term.terminal.scrollViewport(.{ .delta = 1 });
         env.gotoChar(env.pointMax());
         _ = env.forwardLine(-@as(i64, @intCast(scrollbar.len)));
     } else {
-        term.scrollViewport(gt.SCROLL_TOP, 0);
+        term.terminal.scrollViewport(.top);
         env.gotoChar(env.pointMin());
     }
 
@@ -187,8 +161,8 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     // If we have a pending resize, commit it now and just rerender the active
     // since the scrollback is already up to date.
     if (self.pending_resize != null) {
-        self.commitResize(term);
-        term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+        try self.commitResize(&term.terminal);
+        term.terminal.scrollViewport(.bottom);
         self.gotoActiveStart(env);
         try self.render(env, term, 0, false);
         // There is now at least self.size.rows number of rows
@@ -196,7 +170,7 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     }
 
     // Evict old scrollback if libghostty also did
-    const libghostty_rows = try term.getTotalRows();
+    const libghostty_rows = term.terminal.screens.active.pages.total_rows;
     if (libghostty_rows < self.rows_in_buffer) {
         env.gotoChar(env.pointMin());
         _ = env.forwardLine(@as(i64, @intCast(self.rows_in_buffer - libghostty_rows)));
@@ -207,7 +181,7 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     try self.renderCursor(env);
 
     // Update working directory from OSC 7
-    if (try term.getPwd()) |pwd| {
+    if (term.terminal.getPwd()) |pwd| {
         _ = env.f("ghostel--update-directory", .{pwd});
     }
 
@@ -216,8 +190,8 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     // to the bottom (`offset + len == total`), which we treat as the rebuild
     // signal. If scrollback only grew, the parked position naturally points at
     // the old active area, and advancing by 1 reaches the new one.
-    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
-    term.scrollViewport(gt.SCROLL_DELTA, -1);
+    term.terminal.scrollViewport(.bottom);
+    term.terminal.scrollViewport(.{ .delta = -1 });
 }
 
 fn updateFontInfo(self: *Self, env: emacs.Env) bool {
@@ -263,9 +237,9 @@ fn probeCoverage(env: emacs.Env, font: emacs.Value) u32 {
     return max_probe;
 }
 
-const ViewportSize = struct { cols: u16, rows: u16 };
+const ViewportSize = struct { cols: u16, rows: u16, cell_w: u32, cell_h: u32 };
 
-fn colorEql(a: ?gt.ColorRgb, b: ?gt.ColorRgb) bool {
+fn colorEql(a: ?gt.color.RGB, b: ?gt.color.RGB) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return a.?.r == b.?.r and a.?.g == b.?.g and a.?.b == b.?.b;
@@ -273,7 +247,7 @@ fn colorEql(a: ?gt.ColorRgb, b: ?gt.ColorRgb) bool {
 
 /// Blend a foreground color toward a background color to produce a "dim" effect.
 /// Uses ~65% foreground / ~35% background weighting.
-fn dimColor(fg: gt.ColorRgb, bg: gt.ColorRgb) gt.ColorRgb {
+fn dimColor(fg: gt.color.RGB, bg: gt.color.RGB) gt.color.RGB {
     return .{
         .r = @intCast((@as(u16, fg.r) * 166 + @as(u16, bg.r) * 90) / 256),
         .g = @intCast((@as(u16, fg.g) * 166 + @as(u16, bg.g) * 90) / 256),
@@ -282,7 +256,7 @@ fn dimColor(fg: gt.ColorRgb, bg: gt.ColorRgb) gt.ColorRgb {
 }
 
 /// Format an RGB color as "#RRGGBB" into a buffer.
-fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
+fn formatColor(color: gt.color.RGB, buf: *[7]u8) []const u8 {
     const hex = "0123456789abcdef";
     buf[0] = '#';
     buf[1] = hex[color.r >> 4];
@@ -295,59 +269,42 @@ fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
 }
 
 /// Read the style for the current cell from the render state.
-fn readCellProps(self: *Self, term: *Terminal, cells: gt.RenderStateRowCells, key: CellPropKey) !?CellProps {
+fn readCellProps(
+    self: *Self,
+    cell: *const gt.RenderState.Cell,
+    key: CellPropKey,
+) ?CellProps {
     var props: CellProps = .{};
 
-    props.fg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_FG_COLOR) catch |err| switch (err) {
-        gt.Error.InvalidValue => null,
-        else => return err,
-    };
-    props.bg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_BG_COLOR) catch |err| switch (err) {
-        gt.Error.InvalidValue => null,
-        else => return err,
-    };
+    const style: gt.Style = if (cell.raw.hasStyling()) cell.style else .{};
 
-    // Read style attributes
-    if (try gt.rs_row_cells.getOpt(gt.Style, cells, gt.RS_CELLS_DATA_STYLE)) |gs| {
-        props.bold = gs.bold;
-        props.italic = gs.italic;
-        props.faint = gs.faint;
-        props.underline = gs.underline;
-        props.strikethrough = gs.strikethrough;
-        props.inverse = gs.inverse;
-
-        // Underline color
-        if (gs.underline_color.tag == gt.c.GHOSTTY_STYLE_COLOR_RGB) {
-            props.underline_color = gs.underline_color.value.rgb;
-        }
-
-        // Bold color handling (matches Ghostty 1.2.0+)
-        if (props.bold and self.bold_config != .none) {
-            if (gs.fg_color.tag == gt.c.GHOSTTY_STYLE_COLOR_PALETTE) {
-                const index = gs.fg_color.value.palette;
-                if (index < 8) {
-                    const palette = try term.getColorPalette();
-                    props.fg = palette[index + 8];
-                }
-            } else if (gs.fg_color.tag == gt.c.GHOSTTY_STYLE_COLOR_NONE) {
-                switch (self.bold_config) {
-                    .fixed => |fixed_color| props.fg = fixed_color,
-                    else => {},
-                }
-            }
-        }
-    }
-
+    props.fg = style.fg(.{
+        .default = self.render_state.colors.foreground,
+        .palette = &self.render_state.colors.palette,
+        .bold = self.bold_config,
+    });
+    props.bg = style.bg(&cell.raw, &self.render_state.colors.palette) orelse
+        self.render_state.colors.background;
+    props.bold = style.flags.bold;
+    props.italic = style.flags.italic;
+    props.faint = style.flags.faint;
+    props.underline = style.flags.underline;
+    props.strikethrough = style.flags.strikethrough;
+    props.inverse = style.flags.inverse;
+    props.underline_color = style.underlineColor(&self.render_state.colors.palette);
     props.hyperlink = key.hyperlink;
     props.prompt = key.prompt;
     props.input = key.input;
 
-    return if (props.isDefault()) null else props;
+    return if (props.isDefault(
+        self.render_state.colors.foreground,
+        self.render_state.colors.background,
+    )) null else props;
 }
 
 /// Apply face properties to a region of the buffer.
 /// Uses (put-text-property START END 'face PLIST).
-fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_colors: *const BgFg) !void {
+fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps) !void {
     if (start >= end) return;
 
     var face_props: FixedArrayList(emacs.Value, 32) = .{};
@@ -358,10 +315,8 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_co
     var bg_buf: [7]u8 = undefined;
     var dim_buf: [7]u8 = undefined;
 
-    const bg = props.bg orelse default_colors.bg;
-    const fg = props.fg orelse default_colors.fg;
-    const effective_fg = if (props.inverse) bg else fg;
-    const effective_bg = if (props.inverse) fg else bg;
+    const effective_fg = if (props.inverse) props.bg else props.fg;
+    const effective_bg = if (props.inverse) props.fg else props.bg;
 
     const s = &emacs.sym;
 
@@ -372,13 +327,13 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_co
         const dim_str = formatColor(dimmed, &dim_buf);
         try face_props.append(s.@":foreground");
         try face_props.append(env.makeString(dim_str));
-    } else if (!colorEql(props.fg, null) or props.inverse) {
+    } else {
         const fg_str = formatColor(effective_fg, &fg_buf);
         try face_props.append(s.@":foreground");
         try face_props.append(env.makeString(fg_str));
     }
 
-    if (!colorEql(props.bg, null) or props.inverse) {
+    {
         const bg_str = formatColor(effective_bg, &bg_buf);
         try face_props.append(s.@":background");
         try face_props.append(env.makeString(bg_str));
@@ -394,19 +349,19 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_co
         try face_props.append(s.italic);
     }
 
-    if (props.underline != 0) {
+    if (props.underline != .none) {
         try face_props.append(s.@":underline");
-        if (props.underline == 1 and props.underline_color == null) {
+        if (props.underline == .single and props.underline_color == null) {
             try face_props.append(env.t());
         } else {
             var ul_props: FixedArrayList(emacs.Value, 4) = .{};
 
             try ul_props.append(s.@":style");
             try ul_props.append(switch (props.underline) {
-                3 => s.wave,
-                2 => s.@"double-line",
-                4 => s.dot,
-                5 => s.dash,
+                .curly => s.wave,
+                .double => s.@"double-line",
+                .dotted => s.dot,
+                .dashed => s.dash,
                 else => s.line,
             });
 
@@ -445,29 +400,23 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_co
     }
 }
 
-/// Check if the current row in the iterator is soft-wrapped.
-fn isRowWrapped(self: *Self) !bool {
-    const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, self.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
-    return try gt.row.get(bool, raw_row, gt.ROW_DATA_WRAP);
-}
-
 /// Properties for a run of cells.
 const CellProps = struct {
-    fg: ?gt.ColorRgb = null,
-    bg: ?gt.ColorRgb = null,
+    fg: gt.color.RGB = .{},
+    bg: gt.color.RGB = .{},
     bold: bool = false,
     italic: bool = false,
     faint: bool = false,
-    underline: c_int = 0, // 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
-    underline_color: ?gt.ColorRgb = null,
+    underline: gt.sgr.Attribute.Underline = .none,
+    underline_color: ?gt.color.RGB = null,
     strikethrough: bool = false,
     inverse: bool = false,
     hyperlink: bool = false,
     prompt: bool = false,
     input: bool = false,
 
-    fn isDefault(self: CellProps) bool {
-        return std.meta.eql(self, .{});
+    fn isDefault(self: CellProps, default_fg: gt.color.RGB, default_bg: gt.color.RGB) bool {
+        return std.meta.eql(self, .{ .fg = default_fg, .bg = default_bg });
     }
 };
 
@@ -475,7 +424,7 @@ const CellProps = struct {
 /// We read this first and if it differs from the previous cell, we read the full
 /// `CellProps`.
 const CellPropKey = struct {
-    style_id: ?gt.c.GhosttyStyleId,
+    style_id: ?@FieldType(gt.page.Cell, "style_id"),
     hyperlink: bool,
     prompt: bool,
     input: bool,
@@ -513,9 +462,6 @@ pub const RowContent = struct {
     /// A list of continuous property runs
     runs: std.ArrayList(Run) = .empty,
 
-    /// Reusable grapheme buffer
-    graphemes: std.ArrayList(u32) = .empty,
-
     /// Build text content and style runs for the current row in the iterator.
     /// Style runs use character (codepoint) offsets for Emacs put-text-property.
     ///
@@ -528,8 +474,7 @@ pub const RowContent = struct {
     pub fn build(
         self: *RowContent,
         term: *Terminal,
-        row: gt.RenderStateRowIterator,
-        row_cells: *gt.RenderStateRowCells,
+        row: *const gt.RenderState.Row,
         adjustment_threshold: u32,
     ) !void {
         try self.clear();
@@ -540,29 +485,13 @@ pub const RowContent = struct {
         var trim_byte_len: usize = 0;
         var trim_char_len: usize = 0;
 
-        const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, row, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
-        const row_hints = try readRowHints(raw_row);
+        const row_hints = readRowHints(row.raw);
 
         var current_prop_key: ?CellPropKey = null;
-        var col: i64 = 0;
-        try gt.rs_row.read(row, gt.RS_ROW_DATA_CELLS, row_cells);
-        while (gt.rs_row_cells_next(row_cells.*)) : (col += 1) {
-            const raw_cell = try gt.rs_row_cells.get(
-                gt.c.GhosttyCell,
-                row_cells.*,
-                gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
-            );
-            const wide = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE);
-            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL or wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_HEAD) continue;
-
-            const graphemes_len = try gt.rs_row_cells.get(u32, row_cells.*, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
-            if (graphemes_len == 0) {
-                self.graphemes.clearRetainingCapacity();
-                try self.graphemes.append(RowContent.allocator, ' ');
-            } else {
-                try self.graphemes.resize(RowContent.allocator, graphemes_len);
-                try gt.rs_row_cells.read(row_cells.*, gt.RS_CELLS_DATA_GRAPHEMES_BUF, self.graphemes.items.ptr);
-            }
+        var col: usize = 0;
+        while (col < row.cells.len) : (col += 1) {
+            const cell = row.cells.get(col);
+            if (cell.raw.wide == .spacer_tail or cell.raw.wide == .spacer_head) continue;
 
             // We use a "key" that holds a minimum set of values that are cheap to
             // read and compare to detect style run breaks. Only when we detect a
@@ -575,29 +504,25 @@ pub const RowContent = struct {
                 .input = false,
             };
 
-            if (row_hints.row_semantic_prompt != gt.c.GHOSTTY_ROW_SEMANTIC_NONE) {
-                const semantic_prompt = try gt.cell.get(
-                    gt.c.GhosttyCellSemanticContent,
-                    raw_cell,
-                    gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT,
-                );
-                prop_key.prompt = semantic_prompt == gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT;
-                prop_key.input = semantic_prompt == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT;
+            if (row_hints.row_semantic_prompt != .none) {
+                const semantic_prompt = cell.raw.semantic_content;
+                prop_key.prompt = semantic_prompt == .prompt;
+                prop_key.input = semantic_prompt == .input;
             }
 
             if (row_hints.may_have_style) {
-                prop_key.style_id = try gt.cell.get(gt.c.GhosttyStyleId, raw_cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID);
+                prop_key.style_id = cell.raw.style_id;
             }
 
             if (row_hints.may_have_hyperlink) {
-                prop_key.hyperlink = try gt.cell.get(bool, raw_cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK);
+                prop_key.hyperlink = cell.raw.hyperlink;
             }
 
             if (!std.meta.eql(@as(?CellPropKey, prop_key), current_prop_key)) {
                 try self.runs.append(RowContent.allocator, .{
                     .start_char = self.char_len,
                     .end_char = self.char_len,
-                    .props = try readCellProps(&term.renderer, term, row_cells.*, prop_key),
+                    .props = readCellProps(&term.renderer, &cell, prop_key),
                 });
                 current_prop_key = prop_key;
             }
@@ -605,19 +530,23 @@ pub const RowContent = struct {
             const byte_start = self.text.items.len;
             const char_start = self.char_len;
 
-            try self.appendGraphemeCluster(self.graphemes.items);
+            const codepoint: u21 = if (cell.raw.hasText()) cell.raw.codepoint() else ' ';
+            try self.appendCodepoints(&[1]u21{codepoint});
+            if (cell.raw.hasGrapheme()) {
+                try self.appendCodepoints(cell.grapheme);
+            }
 
             // If this is a grapheme cluster, or if the char is not covered by
             // the default font, we register it as needing font glyph adjustment
             // to fit into the monospace grid.
-            if (self.graphemes.items.len > 1 or self.graphemes.items[0] >= adjustment_threshold) {
+            if (cell.raw.hasGrapheme() or codepoint >= adjustment_threshold) {
                 try self.adjust_cells.append(RowContent.allocator, .{
-                    .col = col,
+                    .col = @intCast(col),
                     .byte_start = @intCast(byte_start),
                     .byte_end = @intCast(self.text.items.len),
                     .char_start = @intCast(char_start),
                     .char_end = @intCast(self.char_len),
-                    .wide = wide == gt.c.GHOSTTY_CELL_WIDE_WIDE,
+                    .wide = cell.raw.wide == .wide,
                 });
             }
 
@@ -625,7 +554,7 @@ pub const RowContent = struct {
             last_run.end_char = self.char_len;
 
             // We trim cells that neither have content nor styling
-            if (graphemes_len > 0 or last_run.props != null) {
+            if (cell.raw.hasText() or last_run.props != null) {
                 trim_byte_len = self.text.items.len;
                 trim_char_len = self.char_len;
             }
@@ -648,7 +577,6 @@ pub const RowContent = struct {
         self.text.deinit(allocator);
         self.adjust_cells.deinit(allocator);
         self.runs.deinit(allocator);
-        self.graphemes.deinit(allocator);
     }
 
     fn clear(self: *RowContent) !void {
@@ -658,36 +586,29 @@ pub const RowContent = struct {
         self.char_len = 0;
     }
 
-    fn appendGraphemeCluster(self: *RowContent, cluster: []const u32) !void {
+    fn appendCodepoints(self: *RowContent, cluster: []const u21) !void {
         for (cluster) |cp| {
-            const codepoint: u21 = @intCast(cp);
             const slice = try self.text.addManyAsSlice(
                 allocator,
-                try std.unicode.utf8CodepointSequenceLength(codepoint),
+                try std.unicode.utf8CodepointSequenceLength(cp),
             );
-            _ = try std.unicode.utf8Encode(codepoint, slice);
+            _ = try std.unicode.utf8Encode(cp, slice);
             self.char_len += 1;
         }
     }
 };
 
 const RowHints = struct {
-    row_semantic_prompt: gt.c.GhosttyRowSemanticPrompt,
+    row_semantic_prompt: gt.page.Row.SemanticPrompt,
     may_have_hyperlink: bool,
     may_have_style: bool,
 };
 
-fn readRowHints(row: gt.c.GhosttyRow) !RowHints {
-    const row_semantic_prompt, const maybe_hyperlink, const maybe_style = try gt.row.getMulti(row, &[_]gt.Multi{
-        .{ gt.c.GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, gt.c.GhosttyRowSemanticPrompt },
-        .{ gt.c.GHOSTTY_ROW_DATA_HYPERLINK, bool },
-        .{ gt.c.GHOSTTY_ROW_DATA_STYLED, bool },
-    });
-
+fn readRowHints(row: gt.page.Row) RowHints {
     return .{
-        .row_semantic_prompt = row_semantic_prompt,
-        .may_have_hyperlink = maybe_hyperlink,
-        .may_have_style = maybe_style,
+        .row_semantic_prompt = row.semantic_prompt,
+        .may_have_hyperlink = row.hyperlink,
+        .may_have_style = row.styled,
     };
 }
 
@@ -787,12 +708,11 @@ fn insertRow(
     self: *Self,
     env: emacs.Env,
     term: *Terminal,
-    default_colors: *const BgFg,
+    row: *const gt.RenderState.Row,
 ) !void {
     try self.row.build(
         term,
-        self.row_iterator,
-        &self.row_cells,
+        row,
         if (self.font_info) |f| f.coverage else std.math.maxInt(u32),
     );
 
@@ -806,13 +726,13 @@ fn insertRow(
         const prop_start = row_start + @as(i64, @intCast(run.start_char));
         const prop_end = row_start + @as(i64, @intCast(run.end_char));
         if (run.props) |props| {
-            try applyProps(env, prop_start, prop_end, props, default_colors);
+            try applyProps(env, prop_start, prop_end, props);
         }
     }
 
     self.adjustGlyphs(env, row_start, row_end);
 
-    if (try self.isRowWrapped()) {
+    if (row.raw.wrap) {
         // Mark newlines from soft-wrapped rows so copy mode can filter them
         const point = env.point();
         const nl_pos = env.makeInteger(env.extractInteger(point) - 1);
@@ -832,38 +752,16 @@ fn insertRow(
 fn positionCursorByCell(self: *Self, env: emacs.Env, cx: u16, cy: u16) !bool {
     if (cx == 0) return true; // already at column 0
 
-    try gt.rs.read(self.render_state, gt.RS_DATA_ROW_ITERATOR, &self.row_iterator);
-
-    // Advance iterator to cursor row cy.
-    {
-        var ri: u16 = 0;
-        while (ri <= cy) : (ri += 1) {
-            if (!gt.rs_row_next(self.row_iterator)) {
-                return false;
-            }
-        }
-    }
-
-    try gt.rs_row.read(self.row_iterator, gt.RS_ROW_DATA_CELLS, &self.row_cells);
-
     // Walk cells 0..cx-1, counting Emacs characters.
     var col: u16 = 0;
     var char_count: i64 = 0;
+    const cells = &self.render_state.row_data.items(.cells)[cy];
     while (col < cx) : (col += 1) {
-        if (!gt.rs_row_cells_next(self.row_cells)) break;
+        const cell = cells.get(col);
+        if (cell.raw.wide == .spacer_head or cell.raw.wide == .spacer_tail) continue;
 
-        const graphemes_len = try gt.rs_row_cells.get(u32, self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
-        if (graphemes_len == 0) {
-            // Spacer tails produce no Emacs character.
-            const raw_cell = try gt.rs_row_cells.get(gt.c.GhosttyCell, self.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW);
-            const wide = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE);
-            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
-                continue;
-            }
-            char_count += 1; // empty cell → space
-        } else {
-            char_count += @intCast(@min(graphemes_len, 16));
-        }
+        const graphemes_len = 1 + if (cell.raw.hasGrapheme()) cell.grapheme.len else 0;
+        char_count += @intCast(graphemes_len);
     }
 
     // Cap at end of line so we never jump past it into the next row
@@ -876,57 +774,41 @@ fn positionCursorByCell(self: *Self, env: emacs.Env, cx: u16, cy: u16) !bool {
 }
 
 const BgFg = struct {
-    bg: gt.ColorRgb,
-    fg: gt.ColorRgb,
+    bg: gt.color.RGB,
+    fg: gt.color.RGB,
 };
 
-fn getDefaultColors(self: *Self) !BgFg {
-    const fg, const bg = try gt.rs.getMulti(self.render_state, &[_]gt.Multi{
-        .{ gt.RS_DATA_COLOR_FOREGROUND, gt.ColorRgb },
-        .{ gt.RS_DATA_COLOR_BACKGROUND, gt.ColorRgb },
-    });
-    return BgFg{ .fg = fg, .bg = bg };
-}
-
 pub fn render(self: *Self, env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !void {
-    try gt.renderStateUpdate(self.render_state, term.terminal);
-    const default_colors = try self.getDefaultColors();
+    try self.render_state.update(std.heap.c_allocator, &term.terminal);
 
-    // Check dirty state.
-    // force_full overrides: the buffer may have been erased by scrollback
-    // sync / resize / rotation above, so we must rebuild even if
-    // libghostty considers the cells clean.
-    const dirty = try gt.rs.get(c_int, self.render_state, gt.RS_DATA_DIRTY);
-
-    if (dirty != gt.DIRTY_FALSE or force_full) {
+    if (self.render_state.dirty != .false or force_full) {
         // Set buffer default face
         var fg_hex: [7]u8 = undefined;
         var bg_hex: [7]u8 = undefined;
         _ = env.f("ghostel--set-buffer-face", .{
-            formatColor(default_colors.fg, &fg_hex),
-            formatColor(default_colors.bg, &bg_hex),
+            formatColor(self.render_state.colors.foreground, &fg_hex),
+            formatColor(self.render_state.colors.background, &bg_hex),
         });
 
         // Incremental redraw: only update dirty rows when possible.
         // force_full bypasses partial mode to avoid stale rows after scrolls.
-        const dirty_full = force_full or dirty == gt.DIRTY_FULL;
-        var row_count: usize = 0;
+        const dirty_full = force_full or self.render_state.dirty == .full;
+        var i: u16 = 0;
+        const row_dirty = self.render_state.row_data.items(.dirty);
 
-        try gt.rs.read(self.render_state, gt.RS_DATA_ROW_ITERATOR, &self.row_iterator);
-        while (gt.rs_row_next(self.row_iterator)) : ({
-            row_count += 1;
+        while (i < self.render_state.rows) : ({
             // Clear per-row dirty flag
-            gt.rs_row.set(self.row_iterator, gt.RS_ROW_OPT_DIRTY, false) catch |err| {
-                env.logError("rs_row.set(DIRTY, false) failed: %s", .{@errorName(err)});
-            };
+            row_dirty[i] = false;
+            i += 1;
         }) {
-            if (row_count < skip) continue;
+            if (i < skip) continue;
 
             // Only process dirty rows
-            const dirty_row = dirty_full or try gt.rs_row.get(bool, self.row_iterator, gt.RS_ROW_DATA_DIRTY);
+            const dirty_row = dirty_full or row_dirty[i];
             if (dirty_row) {
                 env.deleteRegion(env.point(), env.lineBeginningPosition2());
-                try self.insertRow(env, term, &default_colors);
+                const row = self.render_state.row_data.get(i);
+                try self.insertRow(env, term, &row);
             } else {
                 _ = env.forwardLine(1);
             }
@@ -936,7 +818,7 @@ pub fn render(self: *Self, env: emacs.Env, term: *Terminal, skip: usize, force_f
         env.deleteRegion(env.point(), env.pointMax());
 
         // Reset dirty state
-        try gt.rs.set(self.render_state, gt.RS_OPT_DIRTY, gt.DIRTY_FALSE);
+        self.render_state.dirty = .false;
     }
 }
 
@@ -945,27 +827,17 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
     self.gotoActiveStart(env);
     const active_start_int = env.extractInteger(env.point());
 
-    // Batch-fetch cursor style/visibility (always available).
-    const cursor_visible, const cursor_style = try gt.rs.getMulti(self.render_state, &[_]gt.Multi{
-        .{ gt.RS_DATA_CURSOR_VISIBLE, bool },
-        .{ gt.RS_DATA_CURSOR_VISUAL_STYLE, c_int },
-    });
-
     // Position cursor (active-relative row -> absolute line).
     // X/Y are only valid when HAS_VALUE is true, so query separately
     // to avoid stopping the style batch above on NO_VALUE.
-    const cursor_has_value = try gt.rs.get(bool, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_HAS_VALUE);
-    if (cursor_has_value) {
-        const cx = try gt.rs.get(u16, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_X);
-        const cy = try gt.rs.get(u16, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y);
-
+    if (self.render_state.cursor.viewport) |vp| {
         env.gotoCharN(active_start_int);
-        _ = env.forwardLine(@as(i64, cy));
-        if (!try self.positionCursorByCell(env, cx, cy)) {
-            env.moveToColumn(@as(i64, cx));
+        _ = env.forwardLine(@as(i64, vp.y));
+        if (!try self.positionCursorByCell(env, vp.x, vp.y)) {
+            env.moveToColumn(@as(i64, vp.x));
         }
 
-        _ = env.set("ghostel--cursor-pos", env.cons(cx, cy));
+        _ = env.set("ghostel--cursor-pos", env.cons(vp.x, vp.y));
         _ = env.set("ghostel--cursor-char-pos", env.point());
     } else {
         _ = env.set("ghostel--cursor-pos", env.nil());
@@ -973,15 +845,15 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
     }
 
     _ = env.f("ghostel--set-cursor-style", .{
-        cursor_style,
-        if (cursor_visible) env.t() else env.nil(),
+        @intFromEnum(self.render_state.cursor.visual_style),
+        if (self.render_state.cursor.visible) env.t() else env.nil(),
     });
 }
 
 // Render content from the current viewport scroll position all the way to
 // the active area at the current Emacs point.
 fn renderToEnd(self: *Self, env: emacs.Env, term: *Terminal, force_full: bool) !usize {
-    const scrollbar = try term.getScrollbar();
+    const scrollbar = term.terminal.screens.active.pages.scrollbar();
     if (scrollbar.len == 0) return 0;
     const offset_max = scrollbar.total - scrollbar.len;
     // Walk from the current viewport position to offset_max in viewport-sized
@@ -1004,21 +876,17 @@ fn renderToEnd(self: *Self, env: emacs.Env, term: *Terminal, force_full: bool) !
         skip = scrollbar.len - step;
 
         current_offset += step;
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(step));
+        term.terminal.scrollViewport(.{ .delta = @intCast(step) });
     }
 
     return rendered_rows;
 }
 
-fn commitResize(self: *Self, term: *Terminal) void {
+fn commitResize(self: *Self, term: *gt.Terminal) !void {
     if (self.pending_resize) |rz| {
-        _ = gt.term_resize(
-            term.terminal,
-            rz.cols,
-            rz.rows,
-            term.cell_width_px,
-            term.cell_height_px,
-        );
+        try term.resize(std.heap.c_allocator, rz.cols, rz.rows);
+        term.width_px = std.math.mul(u32, rz.cols, rz.cell_w) catch std.math.maxInt(u32);
+        term.height_px = std.math.mul(u32, rz.rows, rz.cell_h) catch std.math.maxInt(u32);
         self.size = rz;
         self.pending_resize = null;
     }

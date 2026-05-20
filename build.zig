@@ -20,8 +20,6 @@ pub fn build(b: *std.Build) void {
         .@"emit-lib-vt" = true,
     });
 
-    const ghostty_lib = ghostty_dep.artifact("ghostty-vt-static");
-
     const mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
         .target = target,
@@ -30,8 +28,11 @@ pub fn build(b: *std.Build) void {
         .strip = if (is_release) true else null,
         .omit_frame_pointer = if (is_release) true else null,
     });
-    addModuleIncludes(mod, emacs_module_dir, ghostty_lib);
-    mod.linkLibrary(ghostty_lib);
+    mod.addSystemIncludePath(emacs_module_dir);
+    mod.addImport(
+        "ghostty-vt",
+        ghostty_dep.module("ghostty-vt"),
+    );
 
     // stb_image for PNG decoding (kitty graphics)
     mod.addIncludePath(b.path("vendor/stb"));
@@ -96,17 +97,12 @@ pub fn build(b: *std.Build) void {
     });
     png_test_mod.addIncludePath(b.path("vendor/stb"));
     png_test_mod.addCSourceFile(.{ .file = b.path("src/stb_image.c") });
+    png_test_mod.addImport(
+        "ghostty-vt",
+        ghostty_dep.module("ghostty-vt"),
+    );
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
     test_step.dependOn(&b.addRunArtifact(png_tests).step);
-}
-
-fn addModuleIncludes(
-    mod: *std.Build.Module,
-    emacs_module_dir: std.Build.LazyPath,
-    ghostty_lib: *std.Build.Step.Compile,
-) void {
-    mod.addSystemIncludePath(emacs_module_dir);
-    mod.addIncludePath(ghostty_lib.getEmittedIncludeTree());
 }
 
 fn resolveEmacsModuleDir(b: *std.Build) std.Build.LazyPath {

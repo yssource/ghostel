@@ -4,18 +4,10 @@
 /// libghostty's allocator interface.  `sys.zig` wraps this for the
 /// libghostty `decode_png` callback contract.
 const std = @import("std");
-
+const gt = @import("ghostty-vt");
 const stb = @cImport({
     @cInclude("stb_image.h");
 });
-
-pub const DecodedImage = struct {
-    /// RGBA bytes (4 channels, 8 bits each).  Owned by the caller-
-    /// supplied allocator.
-    data: []u8,
-    width: u32,
-    height: u32,
-};
 
 pub const DecodeError = error{
     EmptyData,
@@ -28,8 +20,8 @@ pub const DecodeError = error{
 ///
 /// Returns a `DecodedImage` whose `data` slice is owned by `allocator`.
 /// Caller is responsible for `allocator.free(result.data)`.
-pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!DecodedImage {
-    if (data.len == 0) return error.EmptyData;
+pub fn decode(allocator: std.mem.Allocator, data: []const u8) gt.sys.DecodeError!gt.sys.Image {
+    if (data.len == 0) return error.InvalidData;
 
     // stb takes the size as c_int — refuse payloads that don't fit.
     // PNGs above 2 GiB aren't a real-world kitty graphics use case.
@@ -54,8 +46,8 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!Decode
     // hostile/corrupt PNG where w*h*4 overflows usize.
     const w_usize: usize = @intCast(w);
     const h_usize: usize = @intCast(h);
-    const wh = std.math.mul(usize, w_usize, h_usize) catch return error.OverflowDimensions;
-    const pixel_len = std.math.mul(usize, wh, 4) catch return error.OverflowDimensions;
+    const wh = std.math.mul(usize, w_usize, h_usize) catch return error.InvalidData;
+    const pixel_len = std.math.mul(usize, wh, 4) catch return error.InvalidData;
 
     const buf = try allocator.alloc(u8, pixel_len);
     @memcpy(buf, pixels[0..pixel_len]);
@@ -100,9 +92,9 @@ test "decode: 2x2 RGBA PNG yields expected dimensions and pixels" {
     try testing.expectEqual(@as(u8, 0), result.data[15]);
 }
 
-test "decode: empty data returns EmptyData" {
+test "decode: empty data returns InvalidData" {
     const empty = [_]u8{};
-    try testing.expectError(error.EmptyData, decode(testing.allocator, &empty));
+    try testing.expectError(error.InvalidData, decode(testing.allocator, &empty));
 }
 
 test "decode: garbage bytes return InvalidData" {
