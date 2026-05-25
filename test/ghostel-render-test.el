@@ -210,27 +210,31 @@ state the normalizer would treat the leading \\n as bare and emit
 after \"first\\r\" + \"\\nsecond\", exactly as if the pair were sent in
 one call; a bug would leave it on row 2 or otherwise desynced."
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "first\r")
-    (ghostel--write-input term "\nsecond")
-    (ghostel--write-input term-single "first\r\nsecond")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "first\r")
+      (ghostel--write-input term "\nsecond")
+      (ghostel--write-input term-single "first\r\nsecond")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-crlf-split-with-empty-chunk ()
   "An empty write between \\r and \\n preserves the cross-call CR flag.
 Regression guard for a naive implementation that resets `last_input_was_cr'
 on every entry rather than only when input was consumed."
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "first\r")
-    (ghostel--write-input term "")          ; empty chunk must not clear flag
-    (ghostel--write-input term "\nsecond")
-    (ghostel--write-input term-single "first\r\nsecond")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "first\r")
+      (ghostel--write-input term "")          ; empty chunk must not clear flag
+      (ghostel--write-input term "\nsecond")
+      (ghostel--write-input term-single "first\r\nsecond")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-crlf-standalone-cr-then-crlf ()
   "A lone CR followed by a complete CRLF stays two logical line-endings.
@@ -241,13 +245,15 @@ call.  (Bare \\n comes from Emacs PTYs lacking ONLCR; bare \\r from
 programs that explicitly emit a carriage return — both must be passed
 through without cross-call munging.)"
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "a\r")
-    (ghostel--write-input term "\r\nb")
-    (ghostel--write-input term-single "a\r\r\nb")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "a\r")
+      (ghostel--write-input term "\r\nb")
+      (ghostel--write-input term-single "a\r\r\nb")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-render-trims-trailing-whitespace ()
   "Rendered rows do not carry libghostty's full-width padding.

@@ -68,6 +68,29 @@ buffer eventually shows up."
                                  (ghostel--kitty-mediums-bits))))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-exec-sets-identity-bookkeeping ()
+  "`ghostel-exec' restores the buffer identity bookkeeping vars.
+`ghostel--init-buffer' clears `ghostel--managed-buffer-name' and
+`ghostel--buffer-identity'; without restoring them, an OSC 2 title
+sequence would auto-rename the buffer even after the user manually
+renamed it (the rename guard in `ghostel--set-title-default' triggers
+when `managed-buffer-name' is nil)."
+  (let ((buf (generate-new-buffer " *ghostel-exec-identity*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
+                  ((symbol-function 'ghostel--new)
+                   (lambda (&rest _) 'fake-term))
+                  ((symbol-function 'ghostel--set-size-with-cell-dims) #'ignore)
+                  ((symbol-function 'ghostel--apply-palette) #'ignore)
+                  ((symbol-function 'ghostel--apply-bold-config) #'ignore)
+                  ((symbol-function 'ghostel--spawn-pty)
+                   (lambda (&rest _) 'fake-proc)))
+          (ghostel-exec buf "ls" nil)
+          (with-current-buffer buf
+            (should (equal ghostel--managed-buffer-name (buffer-name)))
+            (should (equal ghostel--buffer-identity (buffer-name)))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-eshell-visual-command-mode-toggles-advice ()
   "Enabling/disabling the mode adds/removes the `eshell-exec-visual' advice."
   (let ((was-on ghostel-eshell-visual-command-mode))

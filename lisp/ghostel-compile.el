@@ -68,7 +68,6 @@
 (require 'ghostel)
 (require 'compile)
 
-(declare-function ghostel--new "ghostel-module")
 (declare-function ghostel--set-size "ghostel-module")
 (declare-function ghostel--write-input "ghostel-module")
 
@@ -636,9 +635,6 @@ resize hooks
       ;; minor-mode keymap takes precedence over the major-mode map
       ;; and the buffer-local map, so the keys work in both states.
       (ghostel-compile-toggle-mode 1)
-      (let ((inhibit-read-only t))
-        (erase-buffer))
-      (setq ghostel--pending-output nil)
       ;; Disable OSC 2 title tracking so a compile command's title
       ;; sequence can't rename the buffer mid-run.
       (setq-local ghostel-set-title-function nil)
@@ -648,9 +644,10 @@ resize hooks
       ;; password heuristic looks for - leaving detection on would pop
       ;; a `read-passwd' minibuffer at the start of every compile.
       (setq-local ghostel-detect-password-prompts nil)
-      (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
-      (setq ghostel--term-rows height)
-      (ghostel--apply-palette ghostel--term)
+      ;; Compile reruns reuse the same Emacs buffer.  Route the reset
+      ;; and terminal creation through the shared initializer so buffer
+      ;; and terminal state stay paired.
+      (ghostel--init-buffer buffer height width)
       ;; `kill-compilation' locates our buffer via `compilation-find-buffer',
       ;; which requires `compilation-locs' to be buffer-local (see
       ;; `compilation-buffer-internal-p').  During the run we stay in

@@ -6166,8 +6166,8 @@ matches the PTY window size, and stores the process in
   "Start the shell process with a PTY.
 When `default-directory' is a remote TRAMP path, spawn the shell
 on the remote host."
-  ;; Read dims from the buffer-locals set by `ghostel--init-buffer'
-  ;; (the only caller).  Recomputing from `(window-body-height)' here
+  ;; Read dims from the buffer-locals set by `ghostel--init-buffer'.
+  ;; Recomputing from `(window-body-height)' here
   ;; would query the *selected* window, which can differ from the
   ;; buffer's window when the buffer is shown in a popup that didn't
   ;; get selected — leaving the PTY and the libghostty terminal sized
@@ -6905,23 +6905,18 @@ prevent redraw flicker."
 
 ;;; Entry point
 
-(defun ghostel--prepare-buffer (buffer &optional identity)
-  "Put BUFFER into `ghostel-mode' and record its terminal identity.
-IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
-buffer can be found again after title-tracking renames it."
-  (with-current-buffer buffer
-    (unless (derived-mode-p 'ghostel-mode)
-      (ghostel-mode)
-      (setq ghostel--managed-buffer-name (buffer-name))
-      (setq ghostel--buffer-identity (or identity (buffer-name))))))
+(defun ghostel--init-buffer (buffer &optional rows cols)
+  "Initialize BUFFER as a ghostel terminal.
+This is the invariant boundary between an Emacs buffer and its native
+terminal handle: BUFFER is made empty, stale terminal state is cleared,
+and the newly created terminal is attached immediately as BUFFER's
+buffer-local `ghostel--term'.
 
-(defun ghostel--init-buffer (buffer &optional identity)
-  "Initialize BUFFER as a ghostel terminal if no terminal handle exists yet.
-Terminal dimensions come from BUFFER's displayed window when one
-exists, otherwise from the selected window.  Height uses
-`window-screen-lines' (the metric the standard
-`adjust-window-size-function' path also uses), not
-`window-body-height'.  The former divides the window's pixel height
+Optional ROWS and COLS override size detection.  Otherwise terminal
+dimensions come from BUFFER's displayed window when one exists,
+otherwise from the selected window.  Height uses `window-screen-lines',
+the metric the standard `adjust-window-size-function' path also uses,
+not `window-body-height'.  The former divides the window's pixel height
 by the buffer's `default-line-height', which respects
 `face-remapping-alist' and `:height' on the default face; the latter
 divides by frame char height.  When a theme remaps default —
@@ -6930,32 +6925,88 @@ using `window-body-height' would size the terminal to N rows only to
 have the standard adjust-fn immediately resize to N-K, sending a
 startup SIGWINCH that some TUI apps (Claude Code's /tui fullscreen)
 handle imperfectly (issue #192).
-IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
-buffer can be found again after title-tracking renames it."
+
+This function does not start a process; callers decide what program to
+spawn after initialization."
+  (unless (buffer-live-p buffer)
+    (user-error "Cannot initialize dead buffer as ghostel terminal"))
+  (unless (eq (null rows) (null cols))
+    (user-error "ROWS and COLS must be provided together"))
   (with-current-buffer buffer
-    (unless ghostel--term
-      (ghostel--prepare-buffer buffer identity)
-      (let* ((w (or (get-buffer-window buffer t) (selected-window)))
-             (height (max 1 (if (window-live-p w)
-                                (with-selected-window w
-                                  (floor (window-screen-lines)))
-                              24)))
-             (width  (max 1 (if (window-live-p w)
-                                (window-max-chars-per-line w)
-                              80))))
-        (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback ghostel-kitty-graphics-storage-limit (ghostel--kitty-mediums-bits)))
-        (setq ghostel--term-rows height)
-        (setq ghostel--term-cols width)
-        ;; Seed libghostty's cell dimensions before the shell starts —
-        ;; otherwise kitty graphics placements arriving in the very first
-        ;; output (e.g. timg's transmit-and-place) compute grid_rows=0
-        ;; and the terminal advances the cursor zero rows, leaving the
-        ;; next prompt on top of the image.
-        (ghostel--set-size-with-cell-dims ghostel--term height width)
-        (ghostel--apply-palette ghostel--term)
-        (ghostel--apply-bold-config ghostel--term))
-      (ghostel--start-process))))
+    (when (and ghostel--process (process-live-p ghostel--process))
+      (user-error "Buffer %s already has a running ghostel process"
+                  (buffer-name buffer)))
+    (unless (derived-mode-p 'ghostel-mode)
+      (ghostel-mode))
+    (when ghostel--redraw-timer
+      (cancel-timer ghostel--redraw-timer))
+    (when ghostel--plain-link-detection-timer
+      (cancel-timer ghostel--plain-link-detection-timer))
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (setq ghostel--term nil
+          ghostel--term-rows nil
+          ghostel--term-cols nil
+          ghostel--process nil
+          ghostel--pending-output nil
+          ghostel--redraw-timer nil
+          ghostel--plain-link-detection-timer nil
+          ghostel--plain-link-detection-begin nil
+          ghostel--plain-link-detection-end nil
+          ghostel--force-next-redraw nil
+          ghostel--cursor-pos nil
+          ghostel--cursor-char-pos nil
+          ghostel--rendered-font nil
+          ghostel--managed-buffer-name nil
+          ghostel--buffer-identity nil)
+    (let* ((w (or (get-buffer-window buffer t) (selected-window)))
+           (height (max 1 (or rows
+                              (if (window-live-p w)
+                                  (with-selected-window w
+                                    (floor (window-screen-lines)))
+                                24))))
+           (width  (max 1 (or cols
+                              (if (window-live-p w)
+                                  (window-max-chars-per-line w)
+                                80)))))
+      (setq ghostel--term
+            (ghostel--new height width
+                          ghostel-max-scrollback
+                          ghostel-kitty-graphics-storage-limit
+                          (ghostel--kitty-mediums-bits)))
+      (setq ghostel--term-rows height)
+      (setq ghostel--term-cols width)
+      ;; Seed libghostty's cell dimensions before the process starts —
+      ;; otherwise kitty graphics placements arriving in the very first
+      ;; output (e.g. timg's transmit-and-place) compute grid_rows=0
+      ;; and the terminal advances the cursor zero rows, leaving the
+      ;; next prompt on top of the image.
+      (ghostel--set-size-with-cell-dims ghostel--term height width)
+      (ghostel--apply-palette ghostel--term)
+      (ghostel--apply-bold-config ghostel--term))
+    buffer))
+
+(defun ghostel--create (name &optional display-action rows cols)
+  "Create a fresh ghostel buffer NAME and initialize its terminal.
+DISPLAY-ACTION, when non-nil, is passed to `pop-to-buffer' before
+terminal creation so size detection observes the window that will
+display the terminal.  Optional ROWS and COLS are passed through to
+`ghostel--init-buffer'."
+  (let ((buffer (generate-new-buffer name)))
+    (condition-case err
+        (progn
+          ;; Put the buffer in `ghostel-mode' before display so
+          ;; `display-buffer-alist' rules can match on `derived-mode-p'.
+          (with-current-buffer buffer
+            (ghostel-mode))
+          (when display-action
+            (pop-to-buffer buffer display-action))
+          (ghostel--init-buffer buffer rows cols)
+          buffer)
+      (error
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer))
+       (signal (car err) (cdr err))))))
 
 (defun ghostel--find-buffer-by-identity (identity)
   "Return the live ghostel buffer whose identity equals IDENTITY, or nil.
@@ -6982,15 +7033,23 @@ Returns the buffer."
                          ((numberp arg)
                           (format "%s<%d>" ghostel-buffer-name arg))
                          (t ghostel-buffer-name)))
-         (buffer (if fresh
-                     (generate-new-buffer ghostel-buffer-name)
-                   (or (ghostel--find-buffer-by-identity identity)
-                       (get-buffer-create identity)))))
-    (unless (with-current-buffer buffer (derived-mode-p 'ghostel-mode))
-      (ghostel--prepare-buffer buffer identity))
-    (pop-to-buffer buffer (append display-buffer--same-window-action
-                                  '((category . comint))))
-    (ghostel--init-buffer buffer identity)
+         (display-action (append display-buffer--same-window-action
+                                 '((category . comint))))
+         (existing (and (not fresh)
+                        (ghostel--find-buffer-by-identity identity)))
+         (buffer (or existing
+                     (ghostel--create (or identity ghostel-buffer-name)
+                                      display-action))))
+    (if existing
+        (progn
+          (unless (buffer-local-value 'ghostel--term existing)
+            (user-error "Ghostel buffer %s has no terminal"
+                        (buffer-name existing)))
+          (pop-to-buffer existing display-action))
+      (with-current-buffer buffer
+        (setq ghostel--managed-buffer-name (buffer-name))
+        (setq ghostel--buffer-identity (or identity (buffer-name)))
+        (ghostel--start-process)))
     buffer))
 
 (defun ghostel-exec (buffer program &optional args)
@@ -7010,30 +7069,25 @@ Signals `user-error' if BUFFER already has a live ghostel process."
              (process-live-p (buffer-local-value 'ghostel--process buffer)))
     (user-error "Buffer %s already has a running ghostel process"
                 (buffer-name buffer)))
-  (let ((window (get-buffer-window buffer t)))
+  (let* ((window (get-buffer-window buffer t))
+         ;; Use `window-screen-lines' (not `window-body-height') so the
+         ;; height matches the unit `window-adjust-process-window-size-smallest'
+         ;; uses — see `ghostel--init-buffer' for why.
+         (height (if window
+                     (max 1 (with-selected-window window
+                              (floor (window-screen-lines))))
+                   24))
+         (width (if window
+                    (max 1 (window-max-chars-per-line window))
+                  80)))
     (with-current-buffer buffer
-      (ghostel--prepare-buffer buffer nil)
-      ;; Use `window-screen-lines' (not `window-body-height') so the
-      ;; height matches the unit `window-adjust-process-window-size-smallest'
-      ;; uses — see `ghostel--init-buffer' for why.
-      (let* ((height (if window
-                         (max 1 (with-selected-window window
-                                  (floor (window-screen-lines))))
-                       24))
-             (width (if window
-                        (max 1 (window-max-chars-per-line window))
-                      80))
-             (remote-p (file-remote-p default-directory)))
-        (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback ghostel-kitty-graphics-storage-limit (ghostel--kitty-mediums-bits)))
-        (setq ghostel--term-rows height)
-        (setq ghostel--term-cols width)
-        ;; Seed libghostty's cell dimensions before the program starts —
-        ;; see the matching call in `ghostel--ensure-buffer-state'.
-        (ghostel--set-size-with-cell-dims ghostel--term height width)
-        (ghostel--apply-palette ghostel--term)
-        (ghostel--apply-bold-config ghostel--term)
-        (ghostel--spawn-pty program args height width
+      (ghostel--init-buffer buffer height width)
+      ;; `ghostel--init-buffer' clears identity bookkeeping; restore it so
+      ;; OSC 2 title sequences don't auto-rename a user-renamed buffer
+      (setq ghostel--managed-buffer-name (buffer-name))
+      (setq ghostel--buffer-identity (buffer-name))
+      (let ((remote-p (file-remote-p default-directory)))
+        (ghostel--spawn-pty program args ghostel--term-rows ghostel--term-cols
                             ghostel--default-stty nil remote-p)))))
 
 ;;;###autoload

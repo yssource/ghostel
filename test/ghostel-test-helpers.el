@@ -28,6 +28,22 @@
            ,@body)
        (kill-buffer ,var))))
 
+(defmacro ghostel-test--with-terminal-buffer (spec &rest body)
+  "Run BODY in a fresh ghostel buffer with a terminal attached.
+SPEC is (BUFFER TERM ROWS COLS SCROLLBACK).  The terminal is created
+through the production `ghostel--create' path."
+  (declare (indent 1))
+  (pcase-let ((`(,buffer ,term ,rows ,cols ,scrollback) spec))
+    `(let* ((ghostel-max-scrollback ,scrollback)
+            (,buffer (ghostel--create " *ghostel-test-term*" nil
+                                      ,rows ,cols))
+            (,term (buffer-local-value 'ghostel--term ,buffer)))
+       (unwind-protect
+           (with-current-buffer ,buffer
+             ,@body)
+         (when (buffer-live-p ,buffer)
+           (kill-buffer ,buffer))))))
+
 (defun ghostel-test--row0 (term)
   "Return the first row text from TERM's scrollback."
   (let ((text (or (ghostel--copy-all-text term) "")))
