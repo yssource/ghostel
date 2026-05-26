@@ -601,6 +601,38 @@ but `this-command-keys-vector' retains the ESC prefix."
   (should (eq (lookup-key ghostel-char-mode-map (kbd "C-M-m"))
               #'ghostel-semi-char-mode)))
 
+(ert-deftest ghostel-test-keymap-rebuild-on-exception-change ()
+  "The custom setter for `ghostel-keymap-exceptions' rebuilds input maps.
+Adding a key removes it from `ghostel-semi-char-mode-map' so the
+global Emacs binding takes over; char mode binds every key
+regardless of exceptions."
+  (let ((orig (default-value 'ghostel-keymap-exceptions)))
+    (unwind-protect
+        (progn
+          ;; Baseline: M-o is bound in semi-char (not an exception).
+          (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-o"))
+                      #'ghostel--send-event))
+          (customize-set-variable 'ghostel-keymap-exceptions
+                                  (append orig '("M-o")))
+          (should-not (lookup-key ghostel-semi-char-mode-map (kbd "M-o")))
+          ;; Char mode is unaffected — it captures everything.
+          (should (eq (lookup-key ghostel-char-mode-map (kbd "M-o"))
+                      #'ghostel--send-event)))
+      (customize-set-variable 'ghostel-keymap-exceptions orig))))
+
+(ert-deftest ghostel-test-keymap-rebuild-preserves-object-identity ()
+  "Rebuilding mutates `ghostel-semi-char-mode-map' in place.
+Buffer-local references to the keymap need `eq'-identity to
+survive a rebuild."
+  (let ((orig (default-value 'ghostel-keymap-exceptions))
+        (semi-id ghostel-semi-char-mode-map))
+    (unwind-protect
+        (progn
+          (customize-set-variable 'ghostel-keymap-exceptions
+                                  (append orig '("M-o")))
+          (should (eq ghostel-semi-char-mode-map semi-id)))
+      (customize-set-variable 'ghostel-keymap-exceptions orig))))
+
 (ert-deftest ghostel-test-send-next-key-control-x ()
   "Send-next-key sends the prefix key as raw byte 24 (not intercepted by Emacs)."
   (let (sent-key)

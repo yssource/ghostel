@@ -193,7 +193,7 @@ and watch `mode-line-process` for the current mode indicator.
 
 Most keys are sent to the terminal.  Keys in
 `ghostel-keymap-exceptions` (default: `C-c`, `C-x`, `C-u`, `C-h`,
-`C-g`, `M-x`, `M-o`, `M-:`, `C-\`) pass through to Emacs.
+`M-x`, `M-:`, `C-\`) pass through to Emacs.
 
 | Key         | Action                                 |
 |-------------|----------------------------------------|

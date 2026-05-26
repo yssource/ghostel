@@ -724,7 +724,11 @@ When nil, falls back to `tramp-default-method'."
   '("C-c" "C-x" "C-u" "C-h" "M-x" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
-  :type '(repeat string))
+  :type '(repeat string)
+  :initialize #'custom-initialize-default
+  :set (lambda (sym newval)
+         (set-default sym newval)
+         (ghostel--rebuild-semi-char-keymap)))
 
 (defcustom ghostel-ignore-cursor-change nil
   "When non-nil, ignore terminal requests to change cursor shape or visibility.
@@ -1907,16 +1911,28 @@ bare \\`n'/\\`p' or \\`M-n'/\\`M-p' keeps navigating."
   :doc "Keymap for semi-char mode (the default input mode).
 Most keys are sent to the terminal.  Keys in
 `ghostel-keymap-exceptions' pass through to Emacs.  Inherits the
-\\`C-c' prefix from `ghostel-mode-map'."
-  :parent ghostel-mode-map)
-(ghostel--define-terminal-keys ghostel-semi-char-mode-map)
-;; Yank bindings layer on top of the helper's defaults so the kill
-;; ring wins over `ghostel--send-event' for `M-y', `S-<insert>', etc.
-(define-keymap :keymap ghostel-semi-char-mode-map
-  "C-y"            #'ghostel-yank
-  "S-<insert>"     #'ghostel-yank
-  "<remap> <yank>" #'ghostel-yank
-  "M-y"            #'ghostel-yank-pop)
+\\`C-c' prefix from `ghostel-mode-map'.
+
+Populated by `ghostel--rebuild-semi-char-keymap'.")
+
+(defun ghostel--rebuild-semi-char-keymap ()
+  "Rebuild `ghostel-semi-char-mode-map' from `ghostel-keymap-exceptions'.
+Mutates the existing keymap object in place so any buffer-local
+reference to it picks up the new bindings."
+  (let ((fresh (make-sparse-keymap)))
+    (set-keymap-parent fresh ghostel-mode-map)
+    (ghostel--define-terminal-keys fresh)
+    ;; Yank bindings layer on top of the helper's defaults so the
+    ;; kill ring wins over `ghostel--send-event' for `M-y',
+    ;; `S-<insert>', etc.
+    (define-keymap :keymap fresh
+      "C-y"            #'ghostel-yank
+      "S-<insert>"     #'ghostel-yank
+      "<remap> <yank>" #'ghostel-yank
+      "M-y"            #'ghostel-yank-pop)
+    (setcdr ghostel-semi-char-mode-map (cdr fresh))))
+
+(ghostel--rebuild-semi-char-keymap)
 
 ;; No parent — char mode captures everything, including C-c.
 (defvar-keymap ghostel-char-mode-map
