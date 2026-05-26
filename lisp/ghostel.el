@@ -2516,6 +2516,10 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
   (goto-char (point-max))
   (skip-chars-backward " \t\n"))
 
+;; Let isearch treat this as the buffer-end motion command.
+(put 'ghostel-readonly-end-of-buffer 'isearch-motion
+     (cons (lambda () (goto-char (point-max)) (recenter -1 t)) 'backward))
+
 (defun ghostel-readonly-end-of-line ()
   "Move to the last non-whitespace character on the line."
   (interactive)
