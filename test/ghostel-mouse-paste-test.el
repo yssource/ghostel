@@ -669,7 +669,10 @@ buffer right after they finished selecting."
       (should-not copy-mode-called))))
 
 (ert-deftest ghostel-test-mouse-1-drag-tracking-forwards ()
-  "Drag-end with active tracking forwards via `ghostel--mouse-drag'."
+  "Drag-end with active tracking forwards a release via `ghostel--mouse-drag'.
+A `drag-mouse-N' event is only delivered at the end of a drag, so it
+marks the button release (live motion is streamed separately during the
+drag by `ghostel--mouse-drag-motion')."
   :tags '(native)
   (let ((fake-event `(drag-mouse-1
                       (,(selected-window) 1 (5 . 2) 0)
@@ -690,7 +693,92 @@ buffer right after they finished selecting."
                 ((symbol-function 'process-live-p) (lambda (_p) t)))
         (ghostel-mouse-drag-or-set-region fake-event))
       (should-not set-region-called)
-      (should (equal 2 (nth 0 mouse-event-args))))))   ; action = motion
+      (should (equal 1 (nth 0 mouse-event-args))))))   ; action = release
+
+(ert-deftest ghostel-test-mouse-press-arms-drag-tracking ()
+  "A forwarded press with tracking active arms live motion tracking.
+It sets the variable `track-mouse' to `dragging', records the held
+button, and installs `ghostel--mouse-drag-map' as a transient map.  The
+captured `keep-pred' keeps the map only while the motion handler is
+running, and `on-exit' restores motion tracking and clears the state."
+  :tags '(native)
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (captured-map nil)
+        (captured-keep-pred nil)
+        (captured-on-exit nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (let ((track-mouse nil))
+        (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                   (lambda (_term mode) (eq mode 1002)))
+                  ((symbol-function 'ghostel--mouse-event)
+                   (lambda (&rest _) t))
+                  ((symbol-function 'process-live-p) (lambda (_p) t))
+                  ((symbol-function 'select-window) (lambda (_w) nil))
+                  ((symbol-function 'set-transient-map)
+                   (lambda (map &optional keep-pred on-exit &rest _)
+                     (setq captured-map map
+                           captured-keep-pred keep-pred
+                           captured-on-exit on-exit))))
+          (ghostel--mouse-press fake-event))
+        ;; Tracking armed.
+        (should (eq track-mouse 'dragging))
+        (should (equal 1 ghostel--mouse-drag-button))
+        (should (eq captured-map ghostel--mouse-drag-map))
+        ;; keep-pred holds the map only during the motion handler.
+        (should (let ((this-command 'ghostel--mouse-drag-motion))
+                  (funcall captured-keep-pred)))
+        (should-not (let ((this-command 'ghostel-mouse-release-or-set-point))
+                      (funcall captured-keep-pred)))
+        ;; on-exit restores track-mouse and clears the drag state.
+        (funcall captured-on-exit)
+        (should-not track-mouse)
+        (should-not ghostel--mouse-drag-button)
+        (should-not ghostel--mouse-drag-last-cell)))))
+
+(ert-deftest ghostel-test-mouse-drag-motion-forwards-and-dedups ()
+  "`ghostel--mouse-drag-motion' streams motion for the held button.
+It labels each motion with `ghostel--mouse-drag-button' (movement
+events carry no button) and suppresses repeated events in the same
+cell so the PTY is not flooded."
+  :tags '(native)
+  (let ((forwards nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (setq-local ghostel--mouse-drag-button 1)
+      (cl-letf (((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (push (list action button row col mods) forwards)
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t)))
+        ;; First movement at (col 10 . row 5) forwards a motion (action 2)
+        ;; tagged with the held button 1.
+        (ghostel--mouse-drag-motion `(mouse-movement (,(selected-window) 1 (10 . 5) 0)))
+        ;; Same cell again: deduped, no new forward.
+        (ghostel--mouse-drag-motion `(mouse-movement (,(selected-window) 1 (10 . 5) 0)))
+        ;; New cell: forwarded.
+        (ghostel--mouse-drag-motion `(mouse-movement (,(selected-window) 1 (11 . 6) 0))))
+      (setq forwards (nreverse forwards))
+      (should (equal 2 (length forwards)))
+      (should (equal '(2 1 5 10) (butlast (nth 0 forwards))))
+      (should (equal '(2 1 6 11) (butlast (nth 1 forwards)))))))
+
+(ert-deftest ghostel-test-mouse-drag-motion-needs-held-button ()
+  "`ghostel--mouse-drag-motion' is a no-op when no button is held.
+Guards against stray movement events arriving outside a drag."
+  :tags '(native)
+  (let ((forwarded nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (setq-local ghostel--mouse-drag-button nil)
+      (cl-letf (((symbol-function 'ghostel--mouse-event)
+                 (lambda (&rest _) (setq forwarded t) t))
+                ((symbol-function 'process-live-p) (lambda (_p) t)))
+        (ghostel--mouse-drag-motion `(mouse-movement (,(selected-window) 1 (10 . 5) 0))))
+      (should-not forwarded))))
 
 (ert-deftest ghostel-test-mouse-1-press-tracking-forwards-to-terminal ()
   "Left-press with active mouse-tracking forwards to libghostty.

@@ -2527,6 +2527,35 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
 
 ;;; Mouse input
 
+(defvar-local ghostel--mouse-drag-button nil
+  "Button number held during an in-progress mouse-tracking drag.
+Nil when no drag is in progress.")
+
+(defvar-local ghostel--mouse-drag-last-cell nil
+  "Last (ROW . COL) forwarded as a motion event during a drag.
+Used by `ghostel--mouse-drag-motion' to suppress duplicate motion
+events for the same cell: libghostty is not given a `last_cell' to
+deduplicate against, so without this every `mouse-movement' event
+\(many per cell) would re-encode and spam the PTY.")
+
+(defvar ghostel--mouse-drag-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-movement] #'ghostel--mouse-drag-motion)
+    ;; Movement events that land on a non-text area arrive with a
+    ;; prefix (e.g. [mode-line mouse-movement]).  Route those prefixes
+    ;; back through this same map so a drag straying over the
+    ;; mode-line/fringe/margin still resolves to the motion handler and
+    ;; does not prematurely tear the drag down.
+    (dolist (prefix '( mode-line header-line tab-line vertical-line
+                       left-fringe right-fringe left-margin right-margin
+                       right-divider bottom-divider))
+      (define-key map (vector prefix) map))
+    map)
+  "Transient keymap active while a mouse-tracking drag is in progress.
+Installed by `ghostel--mouse-begin-drag-tracking'; routes
+`mouse-movement' events to `ghostel--mouse-drag-motion' so the
+running program receives a live motion stream during the drag.")
+
 (defun ghostel--mouse-button-number (event)
   "Return the ghostty mouse button number for EVENT."
   (pcase (event-basic-type event)
@@ -2557,7 +2586,56 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             0  ; press
                             (ghostel--mouse-button-number event)
                             row col
-                            (ghostel--mouse-mods event)))))
+                            (ghostel--mouse-mods event))
+      ;; Emacs only emits `mouse-movement' events while `track-mouse'is non-nil,
+      ;; and coalesces a drag into a single `drag-mouse-N' event at release.
+      ;; To give the running program a live motion stream during the drag,
+      ;; start tracking now (only when a DEC mouse-tracking mode is on,
+      ;; so char mode does not arm it for a program that ignores mouse input).
+      (when (ghostel--mouse-tracking-active-p)
+        (ghostel--mouse-begin-drag-tracking event)))))
+
+(defun ghostel--mouse-begin-drag-tracking (event)
+  "Arm live motion forwarding for a drag started by EVENT.
+Records the held button, enables Emacs motion events by setting the variable
+`track-mouse', and installs `ghostel--mouse-drag-map' as a transient map so
+each intermediate `mouse-movement' event is forwarded to the terminal by
+`ghostel--mouse-drag-motion'.  The map stays active until the next non-motion
+command (the button release, which `keep-pred' detects)."
+  (setq ghostel--mouse-drag-button (ghostel--mouse-button-number event)
+        ghostel--mouse-drag-last-cell nil)
+  (let ((old-track-mouse track-mouse)
+        (buffer (current-buffer)))
+    (setq track-mouse 'dragging)
+    (set-transient-map
+     ghostel--mouse-drag-map
+     (lambda () (eq this-command 'ghostel--mouse-drag-motion))
+     (lambda ()
+       (with-current-buffer buffer
+         (setq track-mouse old-track-mouse
+               ghostel--mouse-drag-button nil
+               ghostel--mouse-drag-last-cell nil))))))
+
+(defun ghostel--mouse-drag-motion (event)
+  "Forward mouse-movement EVENT as a motion event during a drag.
+Bound in `ghostel--mouse-drag-map' while a drag is in progress.
+Labels the motion with the button recorded at press time
+\(`mouse-movement' events carry no button) and skips events that stay
+within the same cell so the PTY is not flooded with redundant motion."
+  (interactive "e")
+  (when (and ghostel--term ghostel--process (process-live-p ghostel--process)
+             ghostel--mouse-drag-button)
+    (let* ((posn (event-start event))
+           (col-row (posn-col-row posn))
+           (col (car col-row))
+           (row (cdr col-row)))
+      (unless (equal (cons row col) ghostel--mouse-drag-last-cell)
+        (setq ghostel--mouse-drag-last-cell (cons row col))
+        (ghostel--mouse-event ghostel--term
+                              2  ; motion
+                              ghostel--mouse-drag-button
+                              row col
+                              (ghostel--mouse-mods event))))))
 
 (defun ghostel--mouse-release (event)
   "Handle mouse button release EVENT for terminal mouse tracking."
@@ -2574,7 +2652,12 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             (ghostel--mouse-mods event)))))
 
 (defun ghostel--mouse-drag (event)
-  "Handle mouse drag EVENT as motion for terminal mouse tracking."
+  "Handle drag-end EVENT as a button release for terminal mouse tracking.
+A `drag-mouse-N' event is only delivered at the *end* of a drag, so it marks
+the button release.  Live motion during the drag is streamed separately by
+`ghostel--mouse-drag-motion'; this handler's job is to complete the protocol
+with a release at the final position.  (Sending a release rather than a motion
+also matters for DEC mode 1000, which reports releases but never motion.)"
   (interactive "e")
   (when (and ghostel--term ghostel--process (process-live-p ghostel--process))
     (let* ((posn (event-end event))
@@ -2582,7 +2665,7 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
            (col (car col-row))
            (row (cdr col-row)))
       (ghostel--mouse-event ghostel--term
-                            2  ; motion
+                            1  ; release
                             (ghostel--mouse-button-number event)
                             row col
                             (ghostel--mouse-mods event)))))
