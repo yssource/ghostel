@@ -323,13 +323,18 @@ it.
 Line mode and fullscreen TUIs (vim, less, htop, …) cannot share the
 same keystroke stream — the TUI needs every key forwarded raw, while
 line mode buffers them locally.  Ghostel handles this transparently:
-when an alt-screen TUI starts, line mode pauses (any in-progress
-input is stashed) and the buffer drops to semi-char so the TUI gets
-its keys.  When the TUI exits, line mode resumes at the new prompt
-and the stashed input is reinstated.  Pressing `C-c C-l` while a TUI
-is already running arms the same auto-resume so line mode activates
-when the TUI exits.  An explicit mode switch (`C-c C-j`,
-`ghostel-char-mode`, etc.) cancels the armed auto-resume.
+when an alt-screen TUI starts, line mode drops to semi-char so the
+TUI gets its keys, with a brief message that it will resume on exit.
+When the TUI exits, line mode resumes at the new prompt.
+
+Pressing `C-c C-l` on the alt screen does the right thing for what is
+running.  Over a raw TUI it arms that same auto-resume, so line mode
+activates when the TUI exits; an explicit mode switch (`C-c C-j`,
+`ghostel-char-mode`, etc.) cancels the arming.  At an inner shell
+prompt — a `tmux`/`screen` session whose OSC 133 markers reach
+Ghostel via passthrough — `C-c C-l` enters line mode at that prompt
+directly.  When those markers do not pass through, `C-u C-c C-l`
+forces entry anyway.
 
 | Key         | Action                                   |
 |-------------|------------------------------------------|

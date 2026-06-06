@@ -2714,7 +2714,7 @@ the prompt."
 Covers both `global-hl-line-mode' and buffer-local `hl-line-mode'.")
 
 (defvar-local ghostel--line-mode-paused nil
-  "Snapshot plist captured when alt-screen forced line mode to pause.
+  "Sentinel plist marking line mode as paused, awaiting alt-screen exit.
 Nil when not paused.  Set by `ghostel--line-mode-pause' (auto-pause
 when an alt-screen TUI starts) and by `ghostel--line-mode-defer-entry'
 \(when the user invokes `ghostel-line-mode' while a TUI is already
@@ -3187,6 +3187,12 @@ renderer (chars typed via the PTY in a previous mode).  Cleared to
 many backspaces to erase them — keeps a subsequent send from
 duplicating the prefix when the shell echoes our line back.")
 
+(defvar-local ghostel--line-mode-on-alt-screen nil
+  "Non-nil when line mode was entered deliberately on the alt screen.
+Set by `ghostel--line-mode-enter'; tells `ghostel--line-mode-pre-redraw'
+not to auto-pause line mode merely because the alt screen is up.
+Cleared by `ghostel--line-mode-teardown'.")
+
 (defun ghostel--regex-prompt-end (pos)
   "Return position past the prompt prefix on POS's line, or nil.
 Matches `ghostel-prompt-regexp' anchored at BOL of POS's line.
@@ -3326,6 +3332,16 @@ modes used by less, htop, vim, etc.)."
   (and ghostel--term
        (or (ghostel--mode-enabled ghostel--term 1049)
            (ghostel--mode-enabled ghostel--term 1047))))
+
+(defun ghostel--line-mode-prompt-on-screen-p ()
+  "Return non-nil when a real OSC 133 prompt char sits on the cursor's row.
+Only a `ghostel-prompt' property counts (no regex or cursor fallback),
+so line mode can tell an inner shell prompt reached via tmux/screen passthrough
+from a raw fullscreen TUI when deciding whether to enter on the alt screen."
+  (when-let* ((cursor ghostel--cursor-char-pos)
+              (bol (save-excursion (goto-char cursor)
+                                   (line-beginning-position))))
+    (and (text-property-not-all bol cursor 'ghostel-prompt nil) t)))
 
 (defun ghostel--line-mode-apply-readonly (marker-pos)
   "Mark `[point-min, MARKER-POS)' read-only with the rear-nonsticky trick.
@@ -3510,6 +3526,10 @@ in line mode (the interactive entry validates these)."
         (setq ghostel--line-mode-adopted-count (- input-end prompt-end)))
       (setq ghostel--line-mode-history-index nil)
       (setq ghostel--char-mode-override-active nil)
+      ;; A deliberate alt-screen entry must survive the next redraw's
+      ;; auto-pause, and supersedes any armed sentinel.
+      (setq ghostel--line-mode-on-alt-screen (ghostel--line-mode-alt-screen-p))
+      (setq ghostel--line-mode-paused nil)
       (setq ghostel--input-mode 'line)
       (use-local-map ghostel-line-mode-map)
       (setq ghostel--mode-line-tag (ghostel--mode-line-tag-make 'line ":Line"))
@@ -3540,7 +3560,7 @@ in line mode (the interactive entry validates these)."
       (ghostel--line-mode-maybe-prespawn-bash-completion)
       t)))
 
-(defun ghostel-line-mode ()
+(defun ghostel-line-mode (&optional force)
   "Switch to line mode — edit input locally, send to shell on RET.
 The user types into an editable region between the last prompt
 and `point-max'.  Full Emacs editing (yank, `kill-word',
@@ -3566,17 +3586,30 @@ without OSC 133 (python3, irb, sqlite3, …) work too.  When OSC
 133 markers are present on the cursor's row, the prompt prefix is
 recognised and the input boundary lands right after it.
 
-While a fullscreen TUI is on the alt screen, line mode cannot
-edit (the TUI needs every keystroke raw); calling this command
-during an alt-screen session arms a deferred-activation sentinel
-instead, and line mode resumes automatically when the TUI exits."
-  (interactive)
+On the alt screen, line mode enters at an inner shell prompt whose
+OSC 133 markers reach Ghostel (tmux/screen passthrough); over a raw
+TUI (vim, less) it instead arms and resumes when the TUI exits.  A
+prefix arg (FORCE) forces immediate entry regardless — use it at an
+inner prompt whose OSC 133 does not pass through the multiplexer."
+  (interactive "P")
   (unless ghostel--term
     (user-error "No terminal in this buffer"))
   (cond
-   ((eq ghostel--input-mode 'line))
+   ((eq ghostel--input-mode 'line))     ; already in line mode
+   ;; Forced: trust the user, bypass the alt-screen gate.
+   (force
+    (if (ghostel--line-mode-enter)
+        (message "Line mode: RET sends the whole line; C-c C-j to exit")
+      (user-error "Line mode could not locate the cursor or a prompt")))
+   ;; Alt screen with a real prompt on the cursor row (inner shell) — enter.
+   ((and (ghostel--line-mode-alt-screen-p)
+         (ghostel--line-mode-prompt-on-screen-p)
+         (ghostel--line-mode-enter))
+    (message "Line mode: RET sends the whole line; C-c C-j to exit"))
+   ;; Alt screen, no detectable prompt (raw TUI) — arm instead.
    ((ghostel--line-mode-alt-screen-p)
     (ghostel--line-mode-defer-entry))
+   ;; Primary screen — normal entry.
    ((ghostel--line-mode-enter)
     (message "Line mode: RET sends the whole line; C-c C-j to exit"))
    (t
@@ -3641,10 +3674,9 @@ forces a final redraw so the buffer truncation done at entry is
 re-materialized from libghostty.
 
 When PAUSE is non-nil, skip forwarding pending input to the PTY,
-skip the readline-clearing backspaces (the alt-screen TUI would
-receive them), and skip the trailing redraw — used by
-`ghostel--line-mode-pause' which has already snapshotted the input
-and is running inside `ghostel--redraw-now'."
+skip the readline-clearing backspaces (the alt-screen TUI would receive them),
+and skip the trailing redraw; used by `ghostel--line-mode-pause',
+which discards any type-ahead and runs inside `ghostel--redraw-now'."
   ;; Undo is off outside line mode; disable it before the teardown edits
   ;; below so none of them are recorded.
   (setq buffer-undo-list t)
@@ -3673,6 +3705,7 @@ and is running inside `ghostel--redraw-now'."
   (setq ghostel--line-input-end nil)
   (setq ghostel--line-mode-history-index nil)
   (setq ghostel--line-mode-adopted-count nil)
+  (setq ghostel--line-mode-on-alt-screen nil)
   (when ghostel--line-mode-saved-full-redraw
     (if (car ghostel--line-mode-saved-full-redraw)
         (setq-local ghostel-full-redraw
@@ -3688,21 +3721,21 @@ and is running inside `ghostel--redraw-now'."
         (ghostel--redraw ghostel--term t)))))
 
 (defun ghostel--line-mode-pause ()
-  "Snapshot in-progress input, tear down line mode, switch to semi-char.
-Called by `ghostel--line-mode-pre-redraw' on a 1049/1047 transition
-into the alt screen.  Stashes the snapshot in
-`ghostel--line-mode-paused' so a later alt-screen-off cycle can
-re-enter line mode at the new prompt with the user's typing
-restored."
-  (let ((snapshot (or (ghostel--line-mode-snapshot)
-                      (list :input "" :point-offset nil :mark-offset nil))))
-    (ghostel--line-mode-teardown 'pause)
-    (setq ghostel--char-mode-override-active nil)
-    (setq ghostel--input-mode 'semi-char)
-    (use-local-map ghostel-semi-char-mode-map)
-    (setq ghostel--mode-line-tag nil)
-    (ghostel--mode-line-refresh)
-    (setq ghostel--line-mode-paused snapshot)))
+  "Drop line mode to semi-char while a full-screen app holds the alt screen.
+Called by `ghostel--line-mode-pre-redraw' on a 1049/1047 transition into
+the alt screen.  Arms `ghostel--line-mode-paused' so the alt-screen-off cycle
+re-enters line mode at the new prompt."
+  (ghostel--line-mode-teardown 'pause)
+  (setq ghostel--char-mode-override-active nil)
+  (setq ghostel--input-mode 'semi-char)
+  (use-local-map ghostel-semi-char-mode-map)
+  (setq ghostel--mode-line-tag nil)
+  (ghostel--mode-line-refresh)
+  (setq ghostel--line-mode-paused
+        (list :input "" :point-offset nil :mark-offset nil))
+  (message "Line mode paused; resumes when the TUI exits (%s to force now)"
+           (substitute-command-keys
+            "\\<ghostel-mode-map>\\[universal-argument] \\[ghostel-line-mode]")))
 
 (defun ghostel--line-mode-try-resume ()
   "Re-enter line mode and restore the paused snapshot, if possible.
@@ -3727,20 +3760,23 @@ input captured by an earlier auto-pause)."
   (unless ghostel--line-mode-paused
     (setq ghostel--line-mode-paused
           (list :input "" :point-offset nil :mark-offset nil)))
-  (message "Line mode armed — will activate when the TUI exits"))
+  (message "Line mode armed; will activate when the TUI exits (%s to force now)"
+           (substitute-command-keys
+            "\\<ghostel-mode-map>\\[universal-argument] \\[ghostel-line-mode]")))
 
 (defun ghostel--line-mode-pre-redraw ()
-  "Pause line mode if alt-screen is on while in line mode.
-Runs at the top of `ghostel--redraw-now' after process output has
-already been fed to the terminal, but before the renderer paints.
-Pausing here lets us snapshot the
-in-progress input before libghostty's grid (which does not contain
-it) drives the renderer over the buffer.  After pausing,
-`ghostel--input-mode' is no longer `line', so subsequent calls
-fall through — there is no need for an explicit transition cache."
-  (when (and (eq ghostel--input-mode 'line)
-             (ghostel--line-mode-alt-screen-p))
-    (ghostel--line-mode-pause)))
+  "Pause line mode when the alt screen comes up under it.
+Runs atop `ghostel--redraw-now' before the renderer paints, so line
+mode tears down before libghostty's grid (which lacks the input)
+overwrites the buffer.  A deliberate alt-screen entry
+\(`ghostel--line-mode-on-alt-screen') is exempt; the flag clears
+once the alt screen goes away so a later TUI pauses normally."
+  (when (eq ghostel--input-mode 'line)
+    (if (ghostel--line-mode-alt-screen-p)
+        (unless ghostel--line-mode-on-alt-screen
+          (ghostel--line-mode-pause))
+      ;; Back on the primary screen — re-arm the pause for the next TUI.
+      (setq ghostel--line-mode-on-alt-screen nil))))
 
 (defun ghostel--line-mode-post-redraw ()
   "Resume line mode if alt-screen is off and a paused snapshot is armed.

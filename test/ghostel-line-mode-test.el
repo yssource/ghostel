@@ -403,9 +403,10 @@ sentinel and enters line mode for real once the TUI exits."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-line-mode-pauses-on-alt-screen-on ()
-  "1049 ON while in line-mode snapshots input and drops to semi-char.
-The in-progress input lands in `ghostel--line-mode-paused' so a
-later alt-screen exit can restore it."
+  "1049 ON while in line-mode discards type-ahead and drops to semi-char.
+`ghostel--line-mode-paused' is armed (an empty sentinel) so a later
+alt-screen exit re-enters line mode, but the typed input is not
+preserved."
   (let ((buf (generate-new-buffer " *ghostel-test-line-pause*")))
     (unwind-protect
         (with-current-buffer buf
@@ -429,9 +430,11 @@ later alt-screen exit can restore it."
               (setq alt-on t)
               (ghostel--line-mode-pre-redraw)
               (should (eq ghostel--input-mode 'semi-char))
+              ;; Paused sentinel is armed, but the type-ahead is discarded.
               (should ghostel--line-mode-paused)
-              (should (equal (plist-get ghostel--line-mode-paused :input)
-                             "ls"))
+              (should (equal (plist-get ghostel--line-mode-paused :input) ""))
+              ;; The typed "ls" was deleted from the buffer, not preserved.
+              (should-not (string-match-p "ls" (buffer-string)))
               ;; Input region was extracted from the buffer.
               (should-not (markerp ghostel--line-input-start))
               ;; Read-only props from line-mode entry are gone.
@@ -440,9 +443,10 @@ later alt-screen exit can restore it."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-line-mode-resumes-on-alt-screen-off ()
-  "1049 OFF with a prompt in the buffer re-enters line mode + restores input.
-Drives the pause, then the resume; the snapshotted input lands at
-the new prompt-end and the buffer is back in line mode."
+  "1049 OFF with a prompt in the buffer re-enters line mode.
+Drives the pause, then the resume; the buffer is back in line mode
+at the new prompt.  Type-ahead from before the pause is not
+restored."
   (let ((buf (generate-new-buffer " *ghostel-test-line-resume*")))
     (unwind-protect
         (with-current-buffer buf
@@ -475,11 +479,13 @@ the new prompt-end and the buffer is back in line mode."
               (ghostel--line-mode-post-redraw)
               (should (eq ghostel--input-mode 'line))
               (should-not ghostel--line-mode-paused)
-              (should (equal (ghostel--line-mode-input-text) "ls -la")))))
+              ;; Re-entered at the new prompt with empty input — the
+              ;; pre-pause type-ahead is not carried across.
+              (should (equal (ghostel--line-mode-input-text) "")))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-line-mode-resume-defers-without-prompt ()
-  "Resume with no prompt in the buffer keeps the paused snapshot for next cycle."
+  "Resume with no prompt in the buffer keeps the paused sentinel for next cycle."
   (let ((buf (generate-new-buffer " *ghostel-test-line-resume-defer*")))
     (unwind-protect
         (with-current-buffer buf
@@ -506,18 +512,17 @@ the new prompt-end and the buffer is back in line mode."
               (let ((inhibit-read-only t)) (erase-buffer))
               (setq alt-on nil)
               (ghostel--line-mode-post-redraw)
-              ;; Still paused, snapshot intact, mode still semi-char.
+              ;; Still paused (sentinel intact), mode still semi-char.
               (should (eq ghostel--input-mode 'semi-char))
               (should ghostel--line-mode-paused)
-              (should (equal (plist-get ghostel--line-mode-paused :input)
-                             "echo hi"))
+              (should (equal (plist-get ghostel--line-mode-paused :input) ""))
               ;; Add the new prompt and run another post-redraw —
               ;; resume succeeds.
               (insert (propertize "$ " 'ghostel-prompt t))
               (ghostel--line-mode-post-redraw)
               (should (eq ghostel--input-mode 'line))
               (should-not ghostel--line-mode-paused)
-              (should (equal (ghostel--line-mode-input-text) "echo hi")))))
+              (should (equal (ghostel--line-mode-input-text) "")))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-line-mode-paused-cleared-on-manual-switch ()
@@ -1683,6 +1688,294 @@ force the editor default; teardown must restore the saved value."
               (ghostel-semi-char-mode)
               (should (null cursor-type))
               (should-not ghostel--line-mode-saved-cursor-type))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-enters-on-alt-screen-with-osc133-prompt ()
+  "On the alt screen, a real OSC 133 prompt on the cursor row enters line mode.
+A shell prompt inside tmux/screen whose OSC 133 passed through
+carries `ghostel-prompt' on the cursor row, so line mode should
+enter at that prompt instead of arming."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-alt-enter*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (= mode 1049)))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              (should (eq ghostel--input-mode 'semi-char))
+              (ghostel-line-mode)
+              ;; Entered for real — not armed.
+              (should (eq ghostel--input-mode 'line))
+              (should-not ghostel--line-mode-paused)
+              ;; Flagged as a deliberate alt-screen entry.
+              (should ghostel--line-mode-on-alt-screen))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-arms-on-alt-screen-without-osc133 ()
+  "On the alt screen with no OSC 133 prompt, line mode arms (raw-TUI guard).
+A raw fullscreen TUI (vim/less) paints glyphs but carries no
+`ghostel-prompt' on the cursor row, so line mode must NOT enter —
+it would scrape garbage.  It arms a deferred sentinel instead."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-alt-arm*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; vim-like row: plain text, no prompt prop.
+          (let ((inhibit-read-only t))
+            (insert "~ NORMAL line one"))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (= mode 1049)))
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              (should (eq ghostel--input-mode 'semi-char))
+              (ghostel-line-mode)
+              ;; Stayed in semi-char, armed an empty snapshot.
+              (should (eq ghostel--input-mode 'semi-char))
+              (should ghostel--line-mode-paused)
+              (should (equal (plist-get ghostel--line-mode-paused :input)
+                             "")))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-force-enters-on-alt-screen ()
+  "A prefix arg forces line-mode entry on the alt screen even without OSC 133.
+The multiplexer-without-passthrough user's escape hatch: with a
+cursor to anchor on, a prefix arg bypasses the gate and enters."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-alt-force*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; No prompt prop — only a cursor anchors the boundary.
+          (let ((inhibit-read-only t))
+            (insert "bash-5.2$ "))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc)
+                (ghostel-prompt-regexp nil))  ; force the bare-cursor path
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (= mode 1049)))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              ;; Sanity: without the prefix this would arm, not enter.
+              (should-not (ghostel--line-mode-prompt-on-screen-p))
+              (let ((current-prefix-arg '(4)))
+                (call-interactively #'ghostel-line-mode))
+              (should (eq ghostel--input-mode 'line))
+              (should-not ghostel--line-mode-paused)
+              (should ghostel--line-mode-on-alt-screen))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-force-errors-without-anchor ()
+  "Forced entry with nothing to anchor still errors — never silently no-ops.
+With no cursor and no prompt prop, `ghostel--line-mode-enter'
+returns nil; the forced branch must surface the `user-error'
+rather than leave the mode unchanged."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-force-noanchor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            (insert "no prompt here"))
+          (let ((ghostel--term 'fake)
+                (ghostel--cursor-char-pos nil))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (= mode 1049))))
+              (let ((current-prefix-arg '(4)))
+                (should-error (call-interactively #'ghostel-line-mode)
+                              :type 'user-error)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-alt-screen-entry-not-paused-by-redraw ()
+  "A deliberate alt-screen line-mode survives the next pre-redraw.
+Regression for the pause-on-redraw self-defeat: without the
+`ghostel--line-mode-on-alt-screen' flag, `pre-redraw' would pause
+the freshly-entered line mode on the very next redraw because
+alt-screen is still on, making the whole entry a no-op."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-alt-survive*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (= mode 1049)))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel-line-mode)
+              (should (eq ghostel--input-mode 'line))
+              ;; Next redraw with alt-screen still on must NOT pause us.
+              (ghostel--line-mode-pre-redraw)
+              (should (eq ghostel--input-mode 'line))
+              (should-not ghostel--line-mode-paused))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-normal-pause-still-fires ()
+  "Auto-pause still fires for line mode entered on the PRIMARY screen.
+Guards against the `on-alt-screen' flag accidentally suppressing
+the normal vim-launched-from-a-shell-prompt pause: entry on the
+primary screen leaves the flag nil, so a later alt-screen
+transition pauses as before (type-ahead discarded)."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-normal-pause*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((alt-on nil)
+                (ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode)
+                         (and alt-on (memq mode '(1049 1047)) t)))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              ;; Enter on the primary screen — flag stays nil.
+              (ghostel-line-mode)
+              (should (eq ghostel--input-mode 'line))
+              (should-not ghostel--line-mode-on-alt-screen)
+              (insert "ls")
+              ;; Now a TUI starts; pre-redraw must pause as before.
+              (setq alt-on t)
+              (ghostel--line-mode-pre-redraw)
+              (should (eq ghostel--input-mode 'semi-char))
+              (should ghostel--line-mode-paused)
+              (should (equal (plist-get ghostel--line-mode-paused :input) "")))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-prompt-on-screen-p-ignores-regex ()
+  "`ghostel--line-mode-prompt-on-screen-p' only counts the OSC 133 prop.
+The regex must NOT be treated as a prompt signal on the alt screen:
+a TUI row that happens to look like `$ ' is not a real prompt.  The
+predicate returns nil for a regex-only match and non-nil only when
+the `ghostel-prompt' prop is present."
+  (let ((buf (generate-new-buffer " *ghostel-test-prompt-on-screen*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; Row matches `ghostel-prompt-regexp' (`$ ') but has no prop.
+          (let ((inhibit-read-only t))
+            (insert "$ ls -la"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--cursor-char-pos (point))
+          (should (ghostel--regex-prompt-end ghostel--cursor-char-pos))
+          (should-not (ghostel--line-mode-prompt-on-screen-p))
+          ;; Now add a real prop on the cursor row → non-nil.
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert (propertize "$ " 'ghostel-prompt t))
+            (insert "ls -la"))
+          (setq ghostel--cursor-char-pos (point))
+          (should (ghostel--line-mode-prompt-on-screen-p)))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-force-after-arm-preserves-input-on-alt-exit ()
+  "Arming then force-entering must not double-enter when the TUI later exits.
+Regression for the stale armed-snapshot bug: a first plain
+`ghostel-line-mode' without OSC 133 passthrough arms a sentinel;
+the advertised forced call (with a prefix argument) then enters.
+A real entry
+must clear that sentinel, otherwise the alt-screen-off `post-redraw'
+would call
+`ghostel--line-mode-try-resume' on top of the already-active line
+mode — re-running `ghostel--line-mode-enter', wiping the user's
+typed input (it restores the empty armed snapshot) and clobbering
+the saved `ghostel-full-redraw' state captured on first entry."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-force-after-arm*"))
+        (alt-on t))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode) (and alt-on (= mode 1049))))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--send-encoded) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              ;; First press, no passthrough → arm a sentinel.
+              (ghostel--line-mode-defer-entry)
+              (should ghostel--line-mode-paused)
+              ;; The advertised escape hatch: C-u C-c C-l → force entry.
+              (ghostel-line-mode t)
+              (should (eq ghostel--input-mode 'line))
+              ;; The fix: the real entry cleared the stale sentinel.
+              (should-not ghostel--line-mode-paused)
+              ;; Capture the saved redraw state so we can detect a
+              ;; second entry re-capturing it from modified values.
+              (should-not (car ghostel--line-mode-saved-full-redraw))
+              ;; User types a command in line mode.
+              (goto-char (point-max))
+              (insert "ls -la")
+              ;; User exits the multiplexer: alt screen turns off, a
+              ;; redraw runs pre- then post-redraw.
+              (setq alt-on nil)
+              (ghostel--line-mode-pre-redraw)
+              (ghostel--line-mode-post-redraw)
+              ;; Still in line mode, input intact, no double-enter.
+              (should (eq ghostel--input-mode 'line))
+              (should (equal (ghostel--line-mode-input-text) "ls -la"))
+              (should-not ghostel--line-mode-paused)
+              (should-not (car ghostel--line-mode-saved-full-redraw)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-line-mode-alt-exit-clears-flag-so-primary-tui-pauses ()
+  "Leaving the alt screen drops the deliberate-entry flag.
+Regression for the stale `ghostel--line-mode-on-alt-screen' flag:
+after entering line mode at an inner tmux prompt and then exiting
+the multiplexer (alt screen off) while staying in line mode, a TUI
+later launched at the now-primary prompt must auto-pause as usual —
+the flag must not keep suppressing the pause forever."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-alt-exit-flag*"))
+        (alt-on t))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (setq ghostel--cursor-char-pos (point))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (_term mode)
+                         (and alt-on (memq mode '(1049 1047)) t)))
+                      ((symbol-function 'process-live-p) (lambda (_p) t))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--invalidate) #'ignore))
+              ;; Enter at an inner shell prompt inside tmux (branch c).
+              (ghostel-line-mode)
+              (should (eq ghostel--input-mode 'line))
+              (should ghostel--line-mode-on-alt-screen)
+              ;; Exit the multiplexer: alt off, still in line mode.  The
+              ;; next redraw's pre-redraw must clear the flag.
+              (setq alt-on nil)
+              (ghostel--line-mode-pre-redraw)
+              (should (eq ghostel--input-mode 'line))
+              (should-not ghostel--line-mode-on-alt-screen)
+              ;; Now a real TUI starts at the primary prompt: pre-redraw
+              ;; must pause, exactly as for a normal primary-screen entry.
+              (setq alt-on t)
+              (ghostel--line-mode-pre-redraw)
+              (should (eq ghostel--input-mode 'semi-char))
+              (should ghostel--line-mode-paused))))
       (kill-buffer buf))))
 
 (provide 'ghostel-line-mode-test)
