@@ -463,24 +463,27 @@ than the full terminal `cols'."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-crlf ()
-  "Test that bare LF is normalized to CRLF by the Zig module."
+  "Bare LF preserves the cursor column; only CR returns to column 0.
+The Zig module synthesizes no carriage return — see
+`ghostel-test-write-input-preserves-bare-lf-on-primary'."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
+    ;; "first" occupies cols 0-4; a bare LF keeps the column (5), so
+    ;; "second" is written from col 5 and the cursor ends at col 11.
     (ghostel--write-input term "first\nsecond")
     (let ((state (ghostel--copy-all-text term)))
       (should (string-match-p "first" state))              ; first line
       (should (string-match-p "second" state)))             ; second line
     (let ((cur (ghostel-test--cursor term)))
-      (should (equal 6 (car cur)))                          ; cursor col after LF
-      (should (> (cdr cur) 0)))))
+      (should (equal 11 (car cur)))                         ; column preserved across LF
+      (should (> (cdr cur) 0)))))                           ; advanced to a lower row
 
 (ert-deftest ghostel-test-crlf-split-across-writes ()
-  "CRLF pair split across two write-input calls must not double-insert \\r.
-Chunk A ends with \\r, chunk B starts with \\n.  Without cross-call
-state the normalizer would treat the leading \\n as bare and emit
-\\r\\r\\n to libghostty.  Visible effect: cursor lands on row 1 col 6
-after \"first\\r\" + \"\\nsecond\", exactly as if the pair were sent in
-one call; a bug would leave it on row 2 or otherwise desynced."
+  "A CRLF pair split across two write-input calls behaves like one call.
+Chunk A ends with \\r, chunk B starts with \\n.  The stream parser is
+stateful, so chunk boundaries must not change the result: the cursor
+lands on row 1 col 6 after \"first\\r\" + \"\\nsecond\", exactly as if the
+pair were sent in one call."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
     (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
@@ -493,9 +496,9 @@ one call; a bug would leave it on row 2 or otherwise desynced."
                        (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-crlf-split-with-empty-chunk ()
-  "An empty write between \\r and \\n preserves the cross-call CR flag.
-Regression guard for a naive implementation that resets `last_input_was_cr'
-on every entry rather than only when input was consumed."
+  "An empty write between \\r and \\n does not change rendering.
+Chunk boundaries — including a zero-length write — must not affect how
+a CRLF pair is parsed; the split stream renders the same as one call."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
     (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
@@ -510,12 +513,9 @@ on every entry rather than only when input was consumed."
 
 (ert-deftest ghostel-test-crlf-standalone-cr-then-crlf ()
   "A lone CR followed by a complete CRLF stays two logical line-endings.
-The normalizer must not collapse the trailing CR of write A and the
-leading \\r of write B's \\r\\n into a single sequence: the input
-\"a\\r\" + \"\\r\\nb\" is equivalent to sending \"a\\r\\r\\nb\" in one
-call.  (Bare \\n comes from Emacs PTYs lacking ONLCR; bare \\r from
-programs that explicitly emit a carriage return — both must be passed
-through without cross-call munging.)"
+Splitting across writes must match one call: \"a\\r\" + \"\\r\\nb\" is
+equivalent to sending \"a\\r\\r\\nb\" at once.  CR and LF are forwarded
+verbatim, so chunk boundaries do not change the result."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
     (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)

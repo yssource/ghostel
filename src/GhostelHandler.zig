@@ -12,15 +12,6 @@ const Self = @This();
 
 inner: gt.TerminalStream.Handler,
 
-/// True iff the previous VT parser action was `carriage_return`.
-///
-/// Used by the `.linefeed` arm below for primary-screen bare-LF
-/// normalization: a bare LF first gets a synthetic CR, while a real
-/// CRLF pair is left alone. Since this lives on the stream handler,
-/// the state carries across `vtWrite` chunks, so a CR at the end of
-/// one chunk and an LF at the start of the next still count as CRLF.
-prev_was_cr: bool = false,
-
 pub fn init(terminal: *gt.Terminal) Self {
     return .{ .inner = .init(terminal) };
 }
@@ -39,14 +30,6 @@ pub fn vt(
     value: gt.StreamAction.Value(action),
 ) void {
     switch (action) {
-        .linefeed => {
-            if (!self.prev_was_cr and
-                self.inner.terminal.screens.active_key != .alternate)
-            {
-                self.inner.vt(.carriage_return, {});
-            }
-            self.inner.vt(action, value);
-        },
         // For `semantic_prompt` and `color_operation` we forward FIRST
         // so the standard handler updates terminal state (per-row
         // semantic flag, palette/dynamic color sets), then fire the
@@ -71,8 +54,6 @@ pub fn vt(
 
         else => self.inner.vt(action, value),
     }
-
-    self.prev_was_cr = action == .carriage_return;
 }
 
 // ---------------------------------------------------------------------------

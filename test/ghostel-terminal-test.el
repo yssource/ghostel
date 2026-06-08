@@ -25,27 +25,31 @@
     (should (equal "hello" (ghostel-test--row0 term)))        ; text appears
     (should (equal '(5 . 0) (ghostel-test--cursor term)))     ; cursor after text
 
-    ;; Newline (CRLF — the Zig module normalizes bare LF)
-    (ghostel--write-input term " world\nline2")
+    ;; CRLF starts a fresh line at column 0.
+    (ghostel--write-input term " world\r\nline2")
     (let ((state (ghostel--copy-all-text term)))
       (should (string-match-p "hello world" state))  ; row0 has full first line
       (should (string-match-p "line2" state)))))      ; row1 has line2
 
-(ert-deftest ghostel-test-write-input-normalizes-bare-lf-on-primary ()
-  "On the primary screen, bare LF is normalized to CRLF.
-Emacs PTYs lack ONLCR, so a bare \\n from subprocess output needs an
-inserted \\r to land at column 0 of the next row."
+(ert-deftest ghostel-test-write-input-preserves-bare-lf-on-primary ()
+  "On the primary screen, a bare LF preserves the column.
+The emulator never synthesizes a CR: cooked-mode \\n is turned into
+CRLF by the PTY's ONLCR (enabled via `stty sane' in the spawn
+wrapper), and raw-mode apps that emit bare LF mean a column-preserving
+linefeed.  Synthesizing a CR collapsed inline TUIs that position with
+column-preserving LF + relative CUB to the left margin (issue #388,
+the Antigravity CLI logo)."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "abc\ndef")
-    ;; Inserted \r resets the column; "def" lands at (3 . 1), not (6 . 1).
-    (should (equal '(3 . 1) (ghostel-test--cursor term)))))
+    ;; Column preserved, so "def" lands at (6 . 1), not (3 . 1).
+    (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
 (ert-deftest ghostel-test-write-input-preserves-bare-lf-on-alt-screen-1049 ()
-  "On the alternate screen (DECSET 1049), bare LF preserves the column.
-Apps that target the alt screen (tmux, vim, less) emit VT-correct LF
-that moves the cursor down with the column preserved; prepending CR
-would corrupt their layout, e.g. tmux pane border erasure misfires."
+  "Bare LF preserves the column on the alternate screen (DECSET 1049).
+Apps that target the alt screen, such as tmux, vim and less, emit
+VT-correct LF that moves the cursor down with the column preserved,
+the same as the primary screen now does."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e[?1049h")
@@ -54,7 +58,7 @@ would corrupt their layout, e.g. tmux pane border erasure misfires."
     (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
 (ert-deftest ghostel-test-write-input-preserves-bare-lf-on-alt-screen-1047 ()
-  "Alt-screen detection covers DECSET 1047 as well as 1049."
+  "Bare LF preserves the column on the alt screen via DECSET 1047 too."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e[?1047h")
@@ -62,23 +66,23 @@ would corrupt their layout, e.g. tmux pane border erasure misfires."
     (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
 (ert-deftest ghostel-test-write-input-preserves-bare-lf-on-alt-screen-47 ()
-  "Alt-screen detection covers the legacy DECSET 47 mode.
-Detection is via `screens.active_key', so the three alt-screen entry
-modes (47 / 1047 / 1049) are handled uniformly."
+  "Bare LF preserves the column on the alt screen via legacy DECSET 47."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e[?47h")
     (ghostel--write-input term "abc\ndef")
     (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
-(ert-deftest ghostel-test-write-input-renormalizes-after-leaving-alt-screen ()
-  "Leaving the alternate screen restores CRLF normalization on primary."
+(ert-deftest ghostel-test-write-input-preserves-bare-lf-after-leaving-alt-screen ()
+  "Leaving the alternate screen does not reintroduce CR normalization.
+A bare LF on the primary screen still preserves the column after the
+alternate screen has been entered and left."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e[?1049h")
     (ghostel--write-input term "\e[?1049l") ; back to primary
     (ghostel--write-input term "abc\ndef")
-    (should (equal '(3 . 1) (ghostel-test--cursor term)))))
+    (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
 (ert-deftest ghostel-test-backspace ()
   "Test backspace (BS) processing by the terminal."
@@ -133,8 +137,8 @@ modes (47 / 1047 / 1049) are handled uniformly."
     (ghostel--redraw term)
     (should (equal '(2 . 0) ghostel--cursor-pos))
 
-    ;; After newline — cursor on row 1
-    (ghostel--write-input term "\nworld")
+    ;; After CRLF — cursor on row 1 at column 0
+    (ghostel--write-input term "\r\nworld")
     (ghostel--redraw term)
     (should (equal '(5 . 1) ghostel--cursor-pos))
 

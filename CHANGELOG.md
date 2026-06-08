@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Bare LF on the primary screen now preserves the cursor column instead of
+  being normalized to CRLF.  The emulator no longer synthesizes a carriage
+  return: cooked-mode `\n` is turned into CRLF by the PTY's ONLCR (enabled by
+  `stty sane` in the spawn wrapper), and raw-mode applications that emit a bare
+  LF mean a column-preserving linefeed.  This fixes inline TUIs (bubbletea /
+  lipgloss apps such as the Antigravity `agy` CLI) whose banners position with
+  column-preserving LF plus relative cursor-back, which previously collapsed to
+  the left margin (#388).
+
 ## [0.33.0] — 2026-06-04
 
 ### Changed
