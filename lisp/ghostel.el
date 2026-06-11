@@ -3105,13 +3105,12 @@ command set the region, so the selection survives the switch."
       (setq ghostel--pre-readonly-mode nil)
       ;; Return to the live viewport before reenabling terminal input.
       (goto-char (point-max))
-      ;; Force the anchor even when DEC 2026 synchronized output is active.
-      (ghostel--anchor-window)
       (setq ghostel--force-next-redraw t)
       (pcase target
         ('char  (ghostel-char-mode))
         ('emacs (ghostel-emacs-mode))
         (_      (ghostel-semi-char-mode)))
+      (ghostel--anchor-window)
       (ghostel-force-redraw))
     (message "Read-only mode exited")))
 
@@ -6118,9 +6117,13 @@ the bottom of WINDOW."
 (defun ghostel--anchor-window (&optional window)
   "Scroll WINDOW so that the last row is aligned to the bottom of the window.
 In graphical frames, use Emacs's pixel layout for exact bottom alignment.
-In text frames, use line-count geometry with no vscroll."
+In text frames, use line-count geometry with no vscroll.
+Do nothing unless WINDOW displays a live Ghostel terminal."
   (when-let* ((window (or window (selected-window)))
-              (buffer (window-buffer window)))
+              (buffer (window-buffer window))
+              ((with-current-buffer buffer
+                 (and (derived-mode-p 'ghostel-mode)
+                      (ghostel--terminal-live-p)))))
     (with-selected-window window
       (with-current-buffer buffer
         (let ((target (point-max)))
